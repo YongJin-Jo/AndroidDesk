@@ -1,0 +1,26 @@
+# Swift Package Manager build products and local Xcode workspace state
+.build/
+.swiftpm/
+
+# Xcode user-specific files and derived products
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# macOS Finder metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Local IDE settings
+.idea/
+.vscode/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Temporary editor files
+*.swp
+*.tmp
