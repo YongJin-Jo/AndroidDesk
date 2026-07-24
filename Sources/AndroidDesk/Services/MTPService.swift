@@ -3,11 +3,16 @@ import MTPBridge
 
 protocol MTPServicing: Sendable {
     func deviceInfo() async throws -> MTPDeviceInfo
+    func disconnect() async
+    func invalidateIndex() async
+    func refreshIndex() async throws -> [RemoteFile]
     func list(path: String) async throws -> [RemoteFile]
     func listChildren(storageID: UInt32, folderID: UInt32) async throws -> [RemoteFile]
     func upload(
         localURL: URL,
         remoteDirectory: String,
+        storageID: UInt32?,
+        folderID: UInt32?,
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws
     func download(
@@ -53,7 +58,10 @@ private let mtpProgressCallback: ADMTPProgressCallback = { bytesTransferred, tot
 }
 
 actor MTPService: MTPServicing {
+    private var connection: OpaquePointer?
+
     func deviceInfo() async throws -> MTPDeviceInfo {
+        disconnectConnection()
         var displayName: UnsafeMutablePointer<CChar>?
         var serialNumber: UnsafeMutablePointer<CChar>?
         var errorMessage: UnsafeMutablePointer<CChar>?
@@ -63,22 +71,59 @@ actor MTPService: MTPServicing {
             ad_mtp_free_string(errorMessage)
         }
 
-        guard ad_mtp_device_info(&displayName, &serialNumber, &errorMessage) == 0,
-              let displayName else {
+        guard let openedConnection = ad_mtp_connect(
+            &displayName,
+            &serialNumber,
+            &errorMessage
+        ) else {
             throw MTPError(message(from: errorMessage))
         }
+        guard let displayName else {
+            ad_mtp_disconnect(openedConnection)
+            throw MTPError(message(from: errorMessage))
+        }
+        connection = openedConnection
         return MTPDeviceInfo(
             displayName: String(cString: displayName),
             serialNumber: serialNumber.map { String(cString: $0) } ?? ""
         )
     }
 
+    func disconnect() async {
+        disconnectConnection()
+    }
+
+    func invalidateIndex() async {
+        guard let connection else { return }
+        ad_mtp_invalidate_index(connection)
+    }
+
+    func refreshIndex() async throws -> [RemoteFile] {
+        let connection = try activeConnection()
+        var items: UnsafeMutablePointer<ADMTPItem>?
+        var count = 0
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        let result = ad_mtp_refresh_index(
+            connection,
+            &items,
+            &count,
+            &errorMessage
+        )
+        return try makeRemoteFiles(
+            result: result,
+            items: items,
+            count: count,
+            errorMessage: errorMessage
+        )
+    }
+
     func list(path: String) async throws -> [RemoteFile] {
+        let connection = try activeConnection()
         var items: UnsafeMutablePointer<ADMTPItem>?
         var count = 0
         var errorMessage: UnsafeMutablePointer<CChar>?
         let result = path.withCString {
-            ad_mtp_list($0, &items, &count, &errorMessage)
+            ad_mtp_list(connection, $0, &items, &count, &errorMessage)
         }
         return try makeRemoteFiles(
             result: result,
@@ -89,10 +134,12 @@ actor MTPService: MTPServicing {
     }
 
     func listChildren(storageID: UInt32, folderID: UInt32) async throws -> [RemoteFile] {
+        let connection = try activeConnection()
         var items: UnsafeMutablePointer<ADMTPItem>?
         var count = 0
         var errorMessage: UnsafeMutablePointer<CChar>?
         let result = ad_mtp_list_children(
+            connection,
             storageID,
             folderID,
             &items,
@@ -110,14 +157,29 @@ actor MTPService: MTPServicing {
     func upload(
         localURL: URL,
         remoteDirectory: String,
+        storageID: UInt32?,
+        folderID: UInt32?,
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws {
+        let connection = try activeConnection()
         var errorMessage: UnsafeMutablePointer<CChar>?
         let reporter = MTPProgressReporter(report: progress)
         let progressContext = Unmanaged.passUnretained(reporter).toOpaque()
         let result = localURL.path.withCString { localPath in
-            remoteDirectory.withCString { remotePath in
+            if let storageID, let folderID {
+                return ad_mtp_upload_to_folder(
+                    connection,
+                    localPath,
+                    storageID,
+                    folderID,
+                    mtpProgressCallback,
+                    progressContext,
+                    &errorMessage
+                )
+            }
+            return remoteDirectory.withCString { remotePath in
                 ad_mtp_upload(
+                    connection,
                     localPath,
                     remotePath,
                     mtpProgressCallback,
@@ -135,11 +197,13 @@ actor MTPService: MTPServicing {
         destination: URL,
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws {
+        let connection = try activeConnection()
         var errorMessage: UnsafeMutablePointer<CChar>?
         let reporter = MTPProgressReporter(report: progress)
         let progressContext = Unmanaged.passUnretained(reporter).toOpaque()
         let result = destination.path.withCString {
             ad_mtp_download(
+                connection,
                 file.objectID,
                 file.storageID,
                 file.isDirectory ? 1 : 0,
@@ -155,6 +219,19 @@ actor MTPService: MTPServicing {
 
     private func message(from pointer: UnsafeMutablePointer<CChar>?) -> String {
         pointer.map { String(cString: $0) } ?? "MTP 작업에 실패했습니다."
+    }
+
+    private func activeConnection() throws -> OpaquePointer {
+        guard let connection else {
+            throw MTPError("MTP 연결이 열려 있지 않습니다. 기기를 다시 연결해 주세요.")
+        }
+        return connection
+    }
+
+    private func disconnectConnection() {
+        guard let connection else { return }
+        ad_mtp_disconnect(connection)
+        self.connection = nil
     }
 
     private func makeRemoteFiles(

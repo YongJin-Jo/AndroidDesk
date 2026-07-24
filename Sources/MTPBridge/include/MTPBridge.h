@@ -12,16 +12,32 @@ typedef struct {
     char *name;
 } ADMTPItem;
 
+typedef struct ADMTPConnection ADMTPConnection;
 typedef int (*ADMTPProgressCallback)(uint64_t sent, uint64_t total, void *context);
 
-int ad_mtp_device_info(char **display_name, char **serial_number, char **error_message);
-int ad_mtp_list(const char *remote_path, ADMTPItem **items, size_t *count, char **error_message);
-int ad_mtp_list_children(uint32_t storage_id, uint32_t folder_id,
+ADMTPConnection *ad_mtp_connect(char **display_name, char **serial_number,
+                                char **error_message);
+void ad_mtp_disconnect(ADMTPConnection *connection);
+void ad_mtp_invalidate_index(ADMTPConnection *connection);
+int ad_mtp_refresh_index(ADMTPConnection *connection,
+                         ADMTPItem **root_items, size_t *root_count,
+                         char **error_message);
+int ad_mtp_list(ADMTPConnection *connection, const char *remote_path,
+                ADMTPItem **items, size_t *count, char **error_message);
+int ad_mtp_list_children(ADMTPConnection *connection,
+                         uint32_t storage_id, uint32_t folder_id,
                          ADMTPItem **items, size_t *count, char **error_message);
-int ad_mtp_upload(const char *local_path, const char *remote_directory,
+int ad_mtp_upload(ADMTPConnection *connection,
+                  const char *local_path, const char *remote_directory,
                   ADMTPProgressCallback progress_callback, void *progress_context,
                   char **error_message);
-int ad_mtp_download(uint32_t object_id, uint32_t storage_id, int is_directory,
+int ad_mtp_upload_to_folder(ADMTPConnection *connection,
+                            const char *local_path,
+                            uint32_t storage_id, uint32_t folder_id,
+                            ADMTPProgressCallback progress_callback,
+                            void *progress_context, char **error_message);
+int ad_mtp_download(ADMTPConnection *connection,
+                    uint32_t object_id, uint32_t storage_id, int is_directory,
                     const char *destination_path,
                     ADMTPProgressCallback progress_callback, void *progress_context,
                     char **error_message);

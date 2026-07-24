@@ -9,16 +9,16 @@ let package = Package(
     ],
     targets: [
         .systemLibrary(
-            name: "CLibMTP",
-            pkgConfig: "libmtp",
-            providers: [
-                .brew(["libmtp"])
-            ]
+            name: "CLibMTP"
         ),
         .target(
             name: "MTPBridge",
             dependencies: ["CLibMTP"],
-            publicHeadersPath: "include"
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .unsafeFlags(["-L/opt/homebrew/opt/libmtp/lib"]),
+                .linkedLibrary("mtp")
+            ]
         ),
         .executableTarget(
             name: "AndroidDesk",

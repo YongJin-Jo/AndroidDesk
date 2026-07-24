@@ -7,6 +7,7 @@ struct ContentView: View {
     private enum SearchField: Hashable {
         case local
         case remote
+        case remotePath
     }
 
     @Bindable var viewModel: AndroidDeviceViewModel
@@ -37,6 +38,9 @@ struct ContentView: View {
         }
         .onChange(of: viewModel.remoteDirectory, initial: true) { _, path in
             remotePathInput = path
+        }
+        .onDisappear {
+            viewModel.stop()
         }
         .fileImporter(
             isPresented: $isImporting,
@@ -113,13 +117,19 @@ struct ContentView: View {
             )
 
             List(viewModel.filteredLocalFiles, selection: $viewModel.selectedLocalFile) { file in
-                HStack {
-                    Image(systemName: file.isDirectory ? "folder" : "doc")
-                        .foregroundStyle(file.isDirectory ? .orange : .secondary)
-                    Text(file.name)
-                    Spacer()
+                Button {
+                    viewModel.selectedLocalFile = file
+                } label: {
+                    HStack {
+                        Image(systemName: file.isDirectory ? "folder" : "doc")
+                            .foregroundStyle(file.isDirectory ? .orange : .secondary)
+                        Text(file.name)
+                        Spacer(minLength: 0)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+                    .contentShape(Rectangle())
                 }
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
                 .simultaneousGesture(
                     TapGesture(count: 2).onEnded {
                         viewModel.openLocalFolder(file)
@@ -129,6 +139,7 @@ struct ContentView: View {
                     NSItemProvider(object: file.url as NSURL)
                 }
                 .tag(file)
+                .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8))
             }
             .overlay {
                 if viewModel.filteredLocalFiles.isEmpty {
@@ -180,6 +191,15 @@ struct ContentView: View {
 
                 TextField("MTP 폴더 (예: /Download)", text: $remotePathInput)
                     .textFieldStyle(.roundedBorder)
+                    .focused($focusedSearchField, equals: .remotePath)
+                    .onKeyPress(.upArrow) {
+                        moveRemoteSelection(by: -1)
+                        return .handled
+                    }
+                    .onKeyPress(.downArrow) {
+                        moveRemoteSelection(by: 1)
+                        return .handled
+                    }
                     .onSubmit { viewModel.openRemotePath(remotePathInput) }
             }
 
@@ -191,19 +211,26 @@ struct ContentView: View {
             )
 
             List(viewModel.filteredRemoteFiles, selection: $viewModel.selectedRemoteFile) { file in
-                HStack {
-                    Image(systemName: file.isDirectory ? "folder" : "doc")
-                        .foregroundStyle(file.isDirectory ? .orange : .secondary)
-                    Text(file.name)
-                    Spacer()
+                Button {
+                    viewModel.selectedRemoteFile = file
+                } label: {
+                    HStack {
+                        Image(systemName: file.isDirectory ? "folder" : "doc")
+                            .foregroundStyle(file.isDirectory ? .orange : .secondary)
+                        Text(file.name)
+                        Spacer(minLength: 0)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+                    .contentShape(Rectangle())
                 }
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
                 .simultaneousGesture(
                     TapGesture(count: 2).onEnded {
                         viewModel.openRemoteFolder(file)
                     }
                 )
                 .tag(file)
+                .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8))
             }
             .overlay {
                 if isRemoteDropTargeted {
@@ -249,6 +276,9 @@ struct ContentView: View {
                     ProgressView()
                         .controlSize(.small)
                 }
+            } else if viewModel.isIndexingRemoteFiles {
+                ProgressView()
+                    .controlSize(.small)
             }
             Text(viewModel.statusMessage)
                 .font(.caption)
@@ -291,6 +321,14 @@ struct ContentView: View {
             TextField(prompt, text: searchText)
                 .textFieldStyle(.roundedBorder)
                 .focused($focusedSearchField, equals: field)
+                .onKeyPress(.upArrow) {
+                    moveSelection(for: field, by: -1)
+                    return .handled
+                }
+                .onKeyPress(.downArrow) {
+                    moveSelection(for: field, by: 1)
+                    return .handled
+                }
             Picker("정렬", selection: sortOption) {
                 ForEach(FileSortOption.allCases) { option in
                     Text(option.rawValue).tag(option)
@@ -310,5 +348,40 @@ struct ContentView: View {
             }
         }
         return !providers.isEmpty
+    }
+
+    private func moveSelection(for field: SearchField, by offset: Int) {
+        switch field {
+        case .local:
+            moveLocalSelection(by: offset)
+        case .remote, .remotePath:
+            moveRemoteSelection(by: offset)
+        }
+    }
+
+    private func moveLocalSelection(by offset: Int) {
+        guard let index = movedIndex(
+            in: viewModel.filteredLocalFiles,
+            selected: viewModel.selectedLocalFile,
+            by: offset
+        ) else { return }
+        viewModel.selectedLocalFile = viewModel.filteredLocalFiles[index]
+    }
+
+    private func moveRemoteSelection(by offset: Int) {
+        guard let index = movedIndex(
+            in: viewModel.filteredRemoteFiles,
+            selected: viewModel.selectedRemoteFile,
+            by: offset
+        ) else { return }
+        viewModel.selectedRemoteFile = viewModel.filteredRemoteFiles[index]
+    }
+
+    private func movedIndex<Item: Hashable>(in items: [Item], selected: Item?, by offset: Int) -> Int? {
+        guard !items.isEmpty else { return nil }
+        guard let selected, let currentIndex = items.firstIndex(of: selected) else {
+            return offset > 0 ? 0 : items.count - 1
+        }
+        return min(max(currentIndex + offset, 0), items.count - 1)
     }
 }

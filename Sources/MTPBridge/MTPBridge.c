@@ -1,6 +1,6 @@
 #include "MTPBridge.h"
 
-#include <libmtp.h>
+#include "../CLibMTP/shim.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -20,6 +20,22 @@ typedef struct {
     ADMTPProgressCallback callback;
     void *context;
 } ADMTPProgressContext;
+
+typedef struct ADMTPIndexedItem {
+    uint32_t object_id;
+    uint32_t parent_id;
+    uint32_t storage_id;
+    uint64_t size;
+    int is_directory;
+    char *name;
+    struct ADMTPIndexedItem *next;
+} ADMTPIndexedItem;
+
+struct ADMTPConnection {
+    LIBMTP_mtpdevice_t *device;
+    ADMTPIndexedItem *index;
+    int index_loaded;
+};
 
 static pthread_once_t ad_mtp_init_once = PTHREAD_ONCE_INIT;
 
@@ -69,6 +85,31 @@ static void ad_mtp_destroy_file_list(LIBMTP_file_t *file) {
         LIBMTP_destroy_file_t(file);
         file = next;
     }
+}
+
+static void ad_mtp_clear_index(ADMTPConnection *connection) {
+    if (connection == NULL) {
+        return;
+    }
+    ADMTPIndexedItem *item = connection->index;
+    while (item != NULL) {
+        ADMTPIndexedItem *next = item->next;
+        free(item->name);
+        free(item);
+        item = next;
+    }
+    connection->index = NULL;
+    connection->index_loaded = 0;
+}
+
+static LIBMTP_mtpdevice_t *ad_mtp_connection_device(
+    ADMTPConnection *connection, char **error_message
+) {
+    if (connection == NULL || connection->device == NULL) {
+        ad_mtp_set_error(error_message, "MTP 연결이 열려 있지 않습니다.");
+        return NULL;
+    }
+    return connection->device;
 }
 
 static int ad_mtp_report_progress(uint64_t sent, uint64_t total,
@@ -223,16 +264,24 @@ static int ad_mtp_resolve_folder(LIBMTP_mtpdevice_t *device,
     return 0;
 }
 
-int ad_mtp_device_info(char **display_name, char **serial_number,
-                       char **error_message) {
+ADMTPConnection *ad_mtp_connect(char **display_name, char **serial_number,
+                                char **error_message) {
     if (display_name != NULL) *display_name = NULL;
     if (serial_number != NULL) *serial_number = NULL;
     if (error_message != NULL) *error_message = NULL;
 
     LIBMTP_mtpdevice_t *device = ad_mtp_open_device(error_message);
     if (device == NULL) {
-        return -1;
+        return NULL;
     }
+
+    ADMTPConnection *connection = calloc(1, sizeof(ADMTPConnection));
+    if (connection == NULL) {
+        LIBMTP_Release_Device(device);
+        ad_mtp_set_error(error_message, "MTP 연결 정보를 만들지 못했습니다.");
+        return NULL;
+    }
+    connection->device = device;
 
     char *friendly_name = LIBMTP_Get_Friendlyname(device);
     char *model_name = LIBMTP_Get_Modelname(device);
@@ -264,14 +313,30 @@ int ad_mtp_device_info(char **display_name, char **serial_number,
     free(model_name);
     free(manufacturer);
     free(serial);
-    LIBMTP_Release_Device(device);
 
     if ((display_name != NULL && *display_name == NULL) ||
         (serial_number != NULL && *serial_number == NULL)) {
+        ad_mtp_disconnect(connection);
         ad_mtp_set_error(error_message, "MTP 기기 정보 처리 중 메모리가 부족합니다.");
-        return -1;
+        return NULL;
     }
-    return 0;
+    return connection;
+}
+
+void ad_mtp_disconnect(ADMTPConnection *connection) {
+    if (connection == NULL) {
+        return;
+    }
+    ad_mtp_clear_index(connection);
+    if (connection->device != NULL) {
+        LIBMTP_Release_Device(connection->device);
+        connection->device = NULL;
+    }
+    free(connection);
+}
+
+void ad_mtp_invalidate_index(ADMTPConnection *connection) {
+    ad_mtp_clear_index(connection);
 }
 
 static int ad_mtp_make_items_from_file_list(LIBMTP_file_t *files,
@@ -310,89 +375,202 @@ static int ad_mtp_make_items_from_file_list(LIBMTP_file_t *files,
     return 0;
 }
 
-static int ad_mtp_make_items_for_parent(LIBMTP_file_t *files, uint32_t parent_id,
-                                        ADMTPItem **items, size_t *count,
-                                        char **error_message) {
+static int ad_mtp_index_item_matches(const ADMTPIndexedItem *item,
+                                     uint32_t parent_id, int is_root) {
+    if (is_root) {
+        return item->parent_id == LIBMTP_FILES_AND_FOLDERS_ROOT ||
+               item->parent_id == 0;
+    }
+    return item->parent_id == parent_id;
+}
+
+static int ad_mtp_copy_index_items(ADMTPIndexedItem *indexed_items,
+                                   uint32_t parent_id, int is_root,
+                                   ADMTPItem **items, size_t *count,
+                                   char **error_message) {
     size_t item_count = 0;
-    for (LIBMTP_file_t *current = files; current != NULL; current = current->next) {
-        if (current->parent_id == parent_id) {
+    for (ADMTPIndexedItem *current = indexed_items;
+         current != NULL; current = current->next) {
+        if (ad_mtp_index_item_matches(current, parent_id, is_root)) {
             item_count++;
         }
     }
+
     ADMTPItem *result = item_count == 0 ? NULL : calloc(item_count, sizeof(ADMTPItem));
     if (item_count > 0 && result == NULL) {
-        ad_mtp_destroy_file_list(files);
-        ad_mtp_set_error(error_message, "MTP 목록 처리 중 메모리가 부족합니다.");
+        ad_mtp_set_error(error_message, "MTP 인덱스 처리 중 메모리가 부족합니다.");
         return -1;
     }
 
     size_t index = 0;
-    for (LIBMTP_file_t *current = files; current != NULL; current = current->next) {
-        if (current->parent_id != parent_id) {
+    for (ADMTPIndexedItem *current = indexed_items;
+         current != NULL; current = current->next) {
+        if (!ad_mtp_index_item_matches(current, parent_id, is_root)) {
             continue;
         }
-        result[index].object_id = current->item_id;
+        result[index].object_id = current->object_id;
         result[index].storage_id = current->storage_id;
-        result[index].size = current->filesize;
-        result[index].is_directory = current->filetype == LIBMTP_FILETYPE_FOLDER;
-        result[index].name = strdup(current->filename == NULL ? "이름 없음" : current->filename);
+        result[index].size = current->size;
+        result[index].is_directory = current->is_directory;
+        result[index].name = strdup(current->name);
         if (result[index].name == NULL) {
             ad_mtp_free_items(result, item_count);
-            ad_mtp_destroy_file_list(files);
-            ad_mtp_set_error(error_message, "MTP 목록 처리 중 메모리가 부족합니다.");
+            ad_mtp_set_error(error_message, "MTP 인덱스 처리 중 메모리가 부족합니다.");
             return -1;
         }
         index++;
     }
 
-    ad_mtp_destroy_file_list(files);
     *items = result;
     *count = item_count;
     return 0;
 }
 
-static int ad_mtp_make_root_items(LIBMTP_file_t *files,
-                                  ADMTPItem **items, size_t *count,
-                                  char **error_message) {
-    size_t item_count = 0;
-    for (LIBMTP_file_t *current = files; current != NULL; current = current->next) {
-        if (current->parent_id == LIBMTP_FILES_AND_FOLDERS_ROOT || current->parent_id == 0) {
-            item_count++;
+static int ad_mtp_add_index_item(ADMTPConnection *connection,
+                                 uint32_t object_id, uint32_t parent_id,
+                                 uint32_t storage_id, uint64_t size,
+                                 int is_directory, const char *name,
+                                 char **error_message) {
+    ADMTPIndexedItem *item = calloc(1, sizeof(ADMTPIndexedItem));
+    if (item == NULL) {
+        ad_mtp_set_error(error_message, "MTP 인덱스 처리 중 메모리가 부족합니다.");
+        return -1;
+    }
+    item->name = strdup(name == NULL ? "이름 없음" : name);
+    if (item->name == NULL) {
+        free(item);
+        ad_mtp_set_error(error_message, "MTP 인덱스 처리 중 메모리가 부족합니다.");
+        return -1;
+    }
+    item->object_id = object_id;
+    item->parent_id = parent_id;
+    item->storage_id = storage_id;
+    item->size = size;
+    item->is_directory = is_directory;
+    item->next = connection->index;
+    connection->index = item;
+    return 0;
+}
+
+static int ad_mtp_add_folder_tree_to_index(ADMTPConnection *connection,
+                                            LIBMTP_folder_t *folders,
+                                            uint32_t parent_id,
+                                            uint32_t storage_id,
+                                            char **error_message) {
+    for (LIBMTP_folder_t *folder = folders; folder != NULL;
+         folder = folder->sibling) {
+        uint32_t folder_storage_id = folder->storage_id == 0
+            ? storage_id
+            : folder->storage_id;
+        if (ad_mtp_add_index_item(
+                connection, folder->folder_id, parent_id, folder_storage_id,
+                0, 1, folder->name, error_message
+            ) != 0) {
+            return -1;
+        }
+        if (folder->child != NULL &&
+            ad_mtp_add_folder_tree_to_index(
+                connection, folder->child, folder->folder_id,
+                folder_storage_id, error_message
+            ) != 0) {
+            return -1;
         }
     }
-    ADMTPItem *result = item_count == 0 ? NULL : calloc(item_count, sizeof(ADMTPItem));
-    if (item_count > 0 && result == NULL) {
-        ad_mtp_destroy_file_list(files);
-        ad_mtp_set_error(error_message, "MTP 목록 처리 중 메모리가 부족합니다.");
+    return 0;
+}
+
+static int ad_mtp_load_index(ADMTPConnection *connection,
+                             char **error_message) {
+    LIBMTP_mtpdevice_t *device = ad_mtp_connection_device(connection, error_message);
+    if (device == NULL) {
         return -1;
     }
 
-    size_t index = 0;
-    for (LIBMTP_file_t *current = files; current != NULL; current = current->next) {
-        if (current->parent_id != LIBMTP_FILES_AND_FOLDERS_ROOT && current->parent_id != 0) {
-            continue;
-        }
-        result[index].object_id = current->item_id;
-        result[index].storage_id = current->storage_id;
-        result[index].size = current->filesize;
-        result[index].is_directory = current->filetype == LIBMTP_FILETYPE_FOLDER;
-        result[index].name = strdup(current->filename == NULL ? "이름 없음" : current->filename);
-        if (result[index].name == NULL) {
-            ad_mtp_free_items(result, item_count);
-            ad_mtp_destroy_file_list(files);
-            ad_mtp_set_error(error_message, "MTP 목록 처리 중 메모리가 부족합니다.");
-            return -1;
-        }
-        index++;
+    ad_mtp_clear_index(connection);
+    LIBMTP_Clear_Errorstack(device);
+    if (LIBMTP_Get_Storage(device, LIBMTP_STORAGE_SORTBY_NOTSORTED) != 0 ||
+        device->storage == NULL) {
+        ad_mtp_set_device_error(device, error_message,
+                                "Android 저장소 정보를 읽지 못했습니다.");
+        return -1;
     }
 
+    for (LIBMTP_devicestorage_t *storage = device->storage;
+         storage != NULL; storage = storage->next) {
+        LIBMTP_Clear_Errorstack(device);
+        LIBMTP_folder_t *folders = LIBMTP_Get_Folder_List_For_Storage(
+            device, storage->id
+        );
+        if (folders == NULL && LIBMTP_Get_Errorstack(device) != NULL) {
+            ad_mtp_set_device_error(device, error_message,
+                                    "MTP 폴더 인덱스를 읽지 못했습니다.");
+            ad_mtp_clear_index(connection);
+            return -1;
+        }
+        int folder_result = ad_mtp_add_folder_tree_to_index(
+            connection, folders, LIBMTP_FILES_AND_FOLDERS_ROOT,
+            storage->id, error_message
+        );
+        LIBMTP_destroy_folder_t(folders);
+        if (folder_result != 0) {
+            ad_mtp_clear_index(connection);
+            return -1;
+        }
+    }
+
+    LIBMTP_Clear_Errorstack(device);
+    LIBMTP_file_t *files = LIBMTP_Get_Filelisting(device);
+    if (files == NULL && LIBMTP_Get_Errorstack(device) != NULL) {
+        ad_mtp_set_device_error(device, error_message,
+                                "MTP 전체 파일 인덱스를 읽지 못했습니다.");
+        ad_mtp_clear_index(connection);
+        return -1;
+    }
+
+    int file_result = 0;
+    for (LIBMTP_file_t *file = files; file != NULL; file = file->next) {
+        if (file->filetype == LIBMTP_FILETYPE_FOLDER) {
+            continue;
+        }
+        if (ad_mtp_add_index_item(
+                connection, file->item_id, file->parent_id, file->storage_id,
+                file->filesize, 0, file->filename, error_message
+            ) != 0) {
+            file_result = -1;
+            break;
+        }
+    }
     ad_mtp_destroy_file_list(files);
-    *items = result;
-    *count = item_count;
+    if (file_result != 0) {
+        ad_mtp_clear_index(connection);
+        return -1;
+    }
+    connection->index_loaded = 1;
     return 0;
 }
 
-int ad_mtp_list(const char *remote_path, ADMTPItem **items, size_t *count,
+int ad_mtp_refresh_index(ADMTPConnection *connection,
+                         ADMTPItem **root_items, size_t *root_count,
+                         char **error_message) {
+    if (root_items == NULL || root_count == NULL) {
+        ad_mtp_set_error(error_message, "MTP 인덱스 결과를 저장할 공간이 없습니다.");
+        return -1;
+    }
+    *root_items = NULL;
+    *root_count = 0;
+    if (error_message != NULL) *error_message = NULL;
+
+    if (ad_mtp_load_index(connection, error_message) != 0) {
+        return -1;
+    }
+    return ad_mtp_copy_index_items(
+        connection->index, LIBMTP_FILES_AND_FOLDERS_ROOT, 1,
+        root_items, root_count, error_message
+    );
+}
+
+int ad_mtp_list(ADMTPConnection *connection, const char *remote_path,
+                ADMTPItem **items, size_t *count,
                 char **error_message) {
     if (items == NULL || count == NULL) {
         ad_mtp_set_error(error_message, "MTP 목록 결과를 저장할 공간이 없습니다.");
@@ -402,36 +580,28 @@ int ad_mtp_list(const char *remote_path, ADMTPItem **items, size_t *count,
     *count = 0;
     if (error_message != NULL) *error_message = NULL;
 
-    LIBMTP_mtpdevice_t *device = ad_mtp_open_device(error_message);
+    LIBMTP_mtpdevice_t *device = ad_mtp_connection_device(connection, error_message);
     if (device == NULL) {
         return -1;
     }
 
     ADMTPFolderLocation location;
     if (ad_mtp_resolve_folder(device, remote_path, &location, error_message) != 0) {
-        LIBMTP_Release_Device(device);
         return -1;
     }
 
     if (location.is_root) {
-        /*
-         * The Xiaomi device rejects a direct root-handle query. The complete
-         * metadata listing is slower, but is the only reliable way to include
-         * both root folders and root files in the visible list.
-         */
-        LIBMTP_file_t *all_files = LIBMTP_Get_Filelisting(device);
-        if (all_files != NULL) {
-            int result = ad_mtp_make_root_items(all_files, items, count, error_message);
-            LIBMTP_Release_Device(device);
-            return result;
+        if (connection->index_loaded) {
+            return ad_mtp_copy_index_items(
+                connection->index, LIBMTP_FILES_AND_FOLDERS_ROOT, 1,
+                items, count, error_message
+            );
         }
-        LIBMTP_Clear_Errorstack(device);
 
         LIBMTP_folder_t *folders = ad_mtp_get_folder_tree(
             device, location.storage_id, error_message
         );
         if (folders == NULL && error_message != NULL && *error_message != NULL) {
-            LIBMTP_Release_Device(device);
             return -1;
         }
 
@@ -443,7 +613,6 @@ int ad_mtp_list(const char *remote_path, ADMTPItem **items, size_t *count,
         ADMTPItem *result = item_count == 0 ? NULL : calloc(item_count, sizeof(ADMTPItem));
         if (item_count > 0 && result == NULL) {
             LIBMTP_destroy_folder_t(folders);
-            LIBMTP_Release_Device(device);
             ad_mtp_set_error(error_message, "MTP 목록 처리 중 메모리가 부족합니다.");
             return -1;
         }
@@ -458,7 +627,6 @@ int ad_mtp_list(const char *remote_path, ADMTPItem **items, size_t *count,
             if (result[index].name == NULL) {
                 ad_mtp_free_items(result, item_count);
                 LIBMTP_destroy_folder_t(folders);
-                LIBMTP_Release_Device(device);
                 ad_mtp_set_error(error_message, "MTP 목록 처리 중 메모리가 부족합니다.");
                 return -1;
             }
@@ -466,10 +634,16 @@ int ad_mtp_list(const char *remote_path, ADMTPItem **items, size_t *count,
         }
 
         LIBMTP_destroy_folder_t(folders);
-        LIBMTP_Release_Device(device);
         *items = result;
         *count = item_count;
         return 0;
+    }
+
+    if (connection->index_loaded) {
+        return ad_mtp_copy_index_items(
+            connection->index, location.folder_id, 0,
+            items, count, error_message
+        );
     }
 
     LIBMTP_file_t *files = ad_mtp_get_files_and_folders(
@@ -478,16 +652,15 @@ int ad_mtp_list(const char *remote_path, ADMTPItem **items, size_t *count,
     if (files == NULL && LIBMTP_Get_Errorstack(device) != NULL) {
         ad_mtp_set_device_error(device, error_message,
                                 "MTP 폴더 목록을 읽지 못했습니다.");
-        LIBMTP_Release_Device(device);
         return -1;
     }
 
     int result = ad_mtp_make_items_from_file_list(files, items, count, error_message);
-    LIBMTP_Release_Device(device);
     return result;
 }
 
-int ad_mtp_list_children(uint32_t storage_id, uint32_t folder_id,
+int ad_mtp_list_children(ADMTPConnection *connection,
+                         uint32_t storage_id, uint32_t folder_id,
                          ADMTPItem **items, size_t *count, char **error_message) {
     if (items == NULL || count == NULL) {
         ad_mtp_set_error(error_message, "MTP 목록 결과를 저장할 공간이 없습니다.");
@@ -497,16 +670,22 @@ int ad_mtp_list_children(uint32_t storage_id, uint32_t folder_id,
     *count = 0;
     if (error_message != NULL) *error_message = NULL;
 
-    LIBMTP_mtpdevice_t *device = ad_mtp_open_device(error_message);
+    LIBMTP_mtpdevice_t *device = ad_mtp_connection_device(connection, error_message);
     if (device == NULL) {
         return -1;
+    }
+
+    if (connection->index_loaded) {
+        return ad_mtp_copy_index_items(
+            connection->index, folder_id, 0,
+            items, count, error_message
+        );
     }
 
     LIBMTP_file_t *files = ad_mtp_get_files_and_folders(device, storage_id, folder_id);
     if (files == NULL && LIBMTP_Get_Errorstack(device) != NULL) {
         ad_mtp_set_device_error(device, error_message,
                                 "MTP 폴더 목록을 읽지 못했습니다.");
-        LIBMTP_Release_Device(device);
         return -1;
     }
 
@@ -516,22 +695,16 @@ int ad_mtp_list_children(uint32_t storage_id, uint32_t folder_id,
          * for GetObjectHandles(parent). Fall back to the complete metadata list
          * only in that case, then keep the filtered result in Swift's cache.
          */
-        files = LIBMTP_Get_Filelisting(device);
-        if (files == NULL && LIBMTP_Get_Errorstack(device) != NULL) {
-            ad_mtp_set_device_error(device, error_message,
-                                    "MTP 전체 파일 목록을 읽지 못했습니다.");
-            LIBMTP_Release_Device(device);
+        if (ad_mtp_load_index(connection, error_message) != 0) {
             return -1;
         }
-        int result = ad_mtp_make_items_for_parent(
-            files, folder_id, items, count, error_message
+        return ad_mtp_copy_index_items(
+            connection->index, folder_id, 0,
+            items, count, error_message
         );
-        LIBMTP_Release_Device(device);
-        return result;
     }
 
     int result = ad_mtp_make_items_from_file_list(files, items, count, error_message);
-    LIBMTP_Release_Device(device);
     return result;
 }
 
@@ -634,11 +807,12 @@ static int ad_mtp_send_path(LIBMTP_mtpdevice_t *device,
     return 0;
 }
 
-int ad_mtp_upload(const char *local_path, const char *remote_directory,
+int ad_mtp_upload(ADMTPConnection *connection,
+                  const char *local_path, const char *remote_directory,
                   ADMTPProgressCallback progress_callback, void *progress_context,
                   char **error_message) {
     if (error_message != NULL) *error_message = NULL;
-    LIBMTP_mtpdevice_t *device = ad_mtp_open_device(error_message);
+    LIBMTP_mtpdevice_t *device = ad_mtp_connection_device(connection, error_message);
     if (device == NULL) {
         return -1;
     }
@@ -646,7 +820,6 @@ int ad_mtp_upload(const char *local_path, const char *remote_directory,
     ADMTPFolderLocation location;
     if (ad_mtp_resolve_folder(device, remote_directory, &location,
                               error_message) != 0) {
-        LIBMTP_Release_Device(device);
         return -1;
     }
     ADMTPProgressContext progress = {
@@ -655,7 +828,32 @@ int ad_mtp_upload(const char *local_path, const char *remote_directory,
     };
     int result = ad_mtp_send_path(device, local_path, location.storage_id,
                                   location.folder_id, &progress, error_message);
-    LIBMTP_Release_Device(device);
+    if (result == 0) {
+        ad_mtp_clear_index(connection);
+    }
+    return result;
+}
+
+int ad_mtp_upload_to_folder(ADMTPConnection *connection,
+                            const char *local_path,
+                            uint32_t storage_id, uint32_t folder_id,
+                            ADMTPProgressCallback progress_callback,
+                            void *progress_context, char **error_message) {
+    if (error_message != NULL) *error_message = NULL;
+    LIBMTP_mtpdevice_t *device = ad_mtp_connection_device(connection, error_message);
+    if (device == NULL) {
+        return -1;
+    }
+
+    ADMTPProgressContext progress = {
+        .callback = progress_callback,
+        .context = progress_context,
+    };
+    int result = ad_mtp_send_path(device, local_path, storage_id, folder_id,
+                                  &progress, error_message);
+    if (result == 0) {
+        ad_mtp_clear_index(connection);
+    }
     return result;
 }
 
@@ -721,12 +919,13 @@ static int ad_mtp_download_folder(LIBMTP_mtpdevice_t *device,
     return result;
 }
 
-int ad_mtp_download(uint32_t object_id, uint32_t storage_id, int is_directory,
+int ad_mtp_download(ADMTPConnection *connection,
+                    uint32_t object_id, uint32_t storage_id, int is_directory,
                     const char *destination_path,
                     ADMTPProgressCallback progress_callback, void *progress_context,
                     char **error_message) {
     if (error_message != NULL) *error_message = NULL;
-    LIBMTP_mtpdevice_t *device = ad_mtp_open_device(error_message);
+    LIBMTP_mtpdevice_t *device = ad_mtp_connection_device(connection, error_message);
     if (device == NULL) {
         return -1;
     }
@@ -748,7 +947,6 @@ int ad_mtp_download(uint32_t object_id, uint32_t storage_id, int is_directory,
             result = -1;
         }
     }
-    LIBMTP_Release_Device(device);
     return result;
 }
 

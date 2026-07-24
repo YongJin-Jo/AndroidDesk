@@ -5,6 +5,8 @@ import Observation
 @MainActor
 @Observable
 final class AndroidDeviceViewModel {
+    private static let localDirectoryBookmarkKey = "localDirectoryBookmark"
+
     private struct RemoteFolderKey: Hashable {
         let storageID: UInt32
         let folderID: UInt32
@@ -30,6 +32,7 @@ final class AndroidDeviceViewModel {
     var remoteSortOption: FileSortOption = .name
     var statusMessage = "준비됨"
     var isWorking = false
+    var isIndexingRemoteFiles = false
     var transferProgress: Double?
     var transferBytes: UInt64 = 0
     var transferTotalBytes: UInt64 = 0
@@ -43,16 +46,32 @@ final class AndroidDeviceViewModel {
     private var remoteFolderID: UInt32?
     private var cachedRootFiles: [RemoteFile] = []
     private var cachedFolderFiles: [RemoteFolderKey: [RemoteFile]] = [:]
+    private var hasRemoteIndex = false
+    private var connectionGeneration = UUID()
+    private var indexGeneration = UUID()
     private var transferStartedAt: Date?
     private var currentTransferID: UUID?
+    private var isAccessingLocalDirectory = false
 
     init(service: any MTPServicing) {
         self.service = service
     }
 
     func start() {
-        loadLocalFiles()
+        if !restoreLocalDirectoryAccess() {
+            chooseLocalFolder()
+        }
         refreshDevice()
+    }
+
+    func stop() {
+        connectionGeneration = UUID()
+        isConnected = false
+        markRemoteIndexStale()
+        let service = service
+        Task {
+            await service.disconnect()
+        }
     }
 
     func loadLocalFiles() {
@@ -91,23 +110,30 @@ final class AndroidDeviceViewModel {
         loadLocalFiles()
     }
 
-    func chooseLocalFolder() {
+    @discardableResult
+    func chooseLocalFolder() -> Bool {
         let panel = NSOpenPanel()
-        panel.title = "표시할 Mac 폴더 선택"
-        panel.prompt = "선택"
+        panel.title = "접근할 Mac 폴더 선택"
+        panel.prompt = "접근 허용"
         panel.directoryURL = localDirectory
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.canCreateDirectories = false
         panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let directory = panel.url else { return }
-        localDirectory = directory
+        guard panel.runModal() == .OK, let directory = panel.url else {
+            statusMessage = "Mac 파일을 보려면 접근할 폴더를 선택하세요."
+            return false
+        }
+        setLocalDirectory(directory, persistAccess: true)
         loadLocalFiles()
+        return true
     }
 
     func refreshDevice() {
         guard !isWorking else { return }
+        connectionGeneration = UUID()
         isConnected = false
+        isIndexingRemoteFiles = false
         deviceDescription = "MTP 기기를 확인하는 중…"
         resetRemoteNavigation()
         remoteFiles = []
@@ -130,6 +156,10 @@ final class AndroidDeviceViewModel {
         guard !isWorking else { return }
         guard isConnected else { refreshDevice(); return }
 
+        if forceRefresh {
+            markRemoteIndexStale()
+        }
+
         if remoteDirectory == "/", !forceRefresh, !cachedRootFiles.isEmpty {
             remoteFiles = cachedRootFiles
             selectedRemoteFile = nil
@@ -151,7 +181,10 @@ final class AndroidDeviceViewModel {
         let service = service
         if let storageID = remoteStorageID, let folderID = remoteFolderID {
             perform(status: "Android 파일 목록을 읽는 중…") {
-                try await service.listChildren(storageID: storageID, folderID: folderID)
+                if forceRefresh {
+                    await service.invalidateIndex()
+                }
+                return try await service.listChildren(storageID: storageID, folderID: folderID)
                     .sorted { lhs, rhs in
                         lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
                     }
@@ -164,7 +197,10 @@ final class AndroidDeviceViewModel {
             }
         } else {
             perform(status: "Android 파일 목록을 읽는 중…") {
-                try await service.list(path: directory).sorted { lhs, rhs in
+                if forceRefresh {
+                    await service.invalidateIndex()
+                }
+                return try await service.list(path: directory).sorted { lhs, rhs in
                     lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
                 }
             } onSuccess: { [weak self] files in
@@ -225,6 +261,8 @@ final class AndroidDeviceViewModel {
         guard !isWorking else { return }
         guard isConnected else { refreshDevice(); return }
         let destination = remoteDirectory
+        let destinationStorageID = remoteStorageID
+        let destinationFolderID = remoteFolderID
         let service = service
         let transferID = beginTransferProgress()
 
@@ -232,7 +270,12 @@ final class AndroidDeviceViewModel {
             for url in urls {
                 let allowed = url.startAccessingSecurityScopedResource()
                 defer { if allowed { url.stopAccessingSecurityScopedResource() } }
-                try await service.upload(localURL: url, remoteDirectory: destination) { [weak self] progress in
+                try await service.upload(
+                    localURL: url,
+                    remoteDirectory: destination,
+                    storageID: destinationStorageID,
+                    folderID: destinationFolderID
+                ) { [weak self] progress in
                     Task { @MainActor [weak self] in
                         self?.updateTransferProgress(progress, for: transferID)
                     }
@@ -242,6 +285,7 @@ final class AndroidDeviceViewModel {
         } onFinish: { [weak self] in
             self?.finishTransferProgress(for: transferID)
         } onSuccess: { [weak self] count in
+            self?.markRemoteIndexStale()
             self?.statusMessage = "\(count)개 항목을 Android로 전송했습니다."
             self?.scheduleRemoteReload()
         }
@@ -362,6 +406,57 @@ final class AndroidDeviceViewModel {
         )
     }
 
+    private func restoreLocalDirectoryAccess() -> Bool {
+        guard let bookmarkData = UserDefaults.standard.data(forKey: Self.localDirectoryBookmarkKey) else {
+            return false
+        }
+
+        do {
+            var isStale = false
+            let directory = try URL(
+                resolvingBookmarkData: bookmarkData,
+                options: [.withSecurityScope],
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            )
+            setLocalDirectory(directory, persistAccess: isStale)
+            guard FileManager.default.isReadableFile(atPath: directory.path) else {
+                releaseLocalDirectoryAccess()
+                UserDefaults.standard.removeObject(forKey: Self.localDirectoryBookmarkKey)
+                return false
+            }
+            loadLocalFiles()
+            return true
+        } catch {
+            UserDefaults.standard.removeObject(forKey: Self.localDirectoryBookmarkKey)
+            return false
+        }
+    }
+
+    private func setLocalDirectory(_ directory: URL, persistAccess: Bool) {
+        releaseLocalDirectoryAccess()
+        localDirectory = directory
+        isAccessingLocalDirectory = directory.startAccessingSecurityScopedResource()
+
+        guard persistAccess else { return }
+        do {
+            let bookmarkData = try directory.bookmarkData(
+                options: [.withSecurityScope],
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            )
+            UserDefaults.standard.set(bookmarkData, forKey: Self.localDirectoryBookmarkKey)
+        } catch {
+            showError(error)
+        }
+    }
+
+    private func releaseLocalDirectoryAccess() {
+        guard isAccessingLocalDirectory else { return }
+        localDirectory.stopAccessingSecurityScopedResource()
+        isAccessingLocalDirectory = false
+    }
+
     private func receiveRemoteFiles(
         _ files: [RemoteFile],
         for directory: String,
@@ -377,6 +472,51 @@ final class AndroidDeviceViewModel {
         remoteFiles = files
         selectedRemoteFile = nil
         statusMessage = "\(files.count)개 항목을 불러왔습니다."
+        if directory == "/", !hasRemoteIndex {
+            startRemoteIndexing()
+        }
+    }
+
+    private func startRemoteIndexing() {
+        guard isConnected, !isIndexingRemoteFiles, !hasRemoteIndex else { return }
+        isIndexingRemoteFiles = true
+        statusMessage = "Android 전체 파일 인덱스를 백그라운드에서 준비하는 중…"
+        let generation = connectionGeneration
+        let requestedIndexGeneration = indexGeneration
+        let service = service
+
+        Task {
+            do {
+                let indexedRootFiles = try await service.refreshIndex().sorted { lhs, rhs in
+                    lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+                }
+                await Task.yield()
+                guard connectionGeneration == generation,
+                      indexGeneration == requestedIndexGeneration,
+                      isConnected else { return }
+                isIndexingRemoteFiles = false
+                hasRemoteIndex = true
+                cachedRootFiles = indexedRootFiles
+                if remoteDirectory == "/" {
+                    remoteFiles = indexedRootFiles
+                    selectedRemoteFile = nil
+                    statusMessage = "Android 인덱스 준비 완료 · \(indexedRootFiles.count)개 최상위 항목"
+                }
+            } catch {
+                guard connectionGeneration == generation,
+                      indexGeneration == requestedIndexGeneration else { return }
+                isIndexingRemoteFiles = false
+                statusMessage = "빠른 목록 모드로 연결됨 · 전체 인덱스는 준비하지 못했습니다."
+            }
+        }
+    }
+
+    private func markRemoteIndexStale() {
+        indexGeneration = UUID()
+        isIndexingRemoteFiles = false
+        hasRemoteIndex = false
+        cachedRootFiles = []
+        cachedFolderFiles = [:]
     }
 
     private func resetRemoteNavigation() {
@@ -384,8 +524,7 @@ final class AndroidDeviceViewModel {
         remoteFolderStack = []
         remoteStorageID = nil
         remoteFolderID = nil
-        cachedRootFiles = []
-        cachedFolderFiles = [:]
+        markRemoteIndexStale()
     }
 
     private func scheduleRemoteReload() {
