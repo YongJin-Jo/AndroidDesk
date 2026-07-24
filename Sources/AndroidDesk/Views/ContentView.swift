@@ -116,31 +116,25 @@ struct ContentView: View {
                 field: .local
             )
 
-            List(viewModel.filteredLocalFiles, selection: $viewModel.selectedLocalFile) { file in
-                Button {
-                    viewModel.selectedLocalFile = file
-                } label: {
+            Table(viewModel.filteredLocalFiles, selection: localSelection) {
+                TableColumn("이름") { file in
                     HStack {
                         Image(systemName: file.isDirectory ? "folder" : "doc")
                             .foregroundStyle(file.isDirectory ? .orange : .secondary)
                         Text(file.name)
                         Spacer(minLength: 0)
                     }
-                    .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+                    .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
                     .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .simultaneousGesture(
-                    TapGesture(count: 2).onEnded {
+                    .onTapGesture(count: 2) {
                         viewModel.openLocalFolder(file)
                     }
-                )
-                .onDrag {
-                    NSItemProvider(object: file.url as NSURL)
+                    .onDrag {
+                        NSItemProvider(object: file.url as NSURL)
+                    }
                 }
-                .tag(file)
-                .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8))
             }
+            .tableColumnHeaders(.hidden)
             .overlay {
                 if viewModel.filteredLocalFiles.isEmpty {
                     ContentUnavailableView(
@@ -152,6 +146,12 @@ struct ContentView: View {
             }
             .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
                 receiveFiles(from: providers)
+            }
+            .onKeyPress(.return) {
+                if let file = viewModel.selectedLocalFile {
+                    viewModel.openLocalFolder(file)
+                }
+                return .handled
             }
 
             HStack {
@@ -210,28 +210,22 @@ struct ContentView: View {
                 field: .remote
             )
 
-            List(viewModel.filteredRemoteFiles, selection: $viewModel.selectedRemoteFile) { file in
-                Button {
-                    viewModel.selectedRemoteFile = file
-                } label: {
+            Table(viewModel.filteredRemoteFiles, selection: remoteSelection) {
+                TableColumn("이름") { file in
                     HStack {
                         Image(systemName: file.isDirectory ? "folder" : "doc")
                             .foregroundStyle(file.isDirectory ? .orange : .secondary)
                         Text(file.name)
                         Spacer(minLength: 0)
                     }
-                    .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+                    .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
                     .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .simultaneousGesture(
-                    TapGesture(count: 2).onEnded {
+                    .onTapGesture(count: 2) {
                         viewModel.openRemoteFolder(file)
                     }
-                )
-                .tag(file)
-                .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8))
+                }
             }
+            .tableColumnHeaders(.hidden)
             .overlay {
                 if isRemoteDropTargeted {
                     RoundedRectangle(cornerRadius: 10)
@@ -252,6 +246,12 @@ struct ContentView: View {
             }
             .onDrop(of: [.fileURL], isTargeted: $isRemoteDropTargeted) { providers in
                 receiveFiles(from: providers)
+            }
+            .onKeyPress(.return) {
+                if let file = viewModel.selectedRemoteFile {
+                    viewModel.openRemoteFolder(file)
+                }
+                return .handled
             }
 
             HStack {
@@ -348,6 +348,24 @@ struct ContentView: View {
             }
         }
         return !providers.isEmpty
+    }
+
+    private var localSelection: Binding<LocalFile.ID?> {
+        Binding(
+            get: { viewModel.selectedLocalFile?.id },
+            set: { id in
+                viewModel.selectedLocalFile = viewModel.filteredLocalFiles.first { $0.id == id }
+            }
+        )
+    }
+
+    private var remoteSelection: Binding<RemoteFile.ID?> {
+        Binding(
+            get: { viewModel.selectedRemoteFile?.id },
+            set: { id in
+                viewModel.selectedRemoteFile = viewModel.filteredRemoteFiles.first { $0.id == id }
+            }
+        )
     }
 
     private func moveSelection(for field: SearchField, by offset: Int) {

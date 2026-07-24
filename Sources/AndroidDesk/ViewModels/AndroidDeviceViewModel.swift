@@ -91,7 +91,7 @@ final class AndroidDeviceViewModel {
                     size: UInt64(values.fileSize ?? 0)
                 )
             }
-            selectedLocalFile = nil
+            selectedLocalFile = filteredLocalFiles.first
         } catch {
             showError(error)
         }
@@ -162,7 +162,7 @@ final class AndroidDeviceViewModel {
 
         if remoteDirectory == "/", !forceRefresh, !cachedRootFiles.isEmpty {
             remoteFiles = cachedRootFiles
-            selectedRemoteFile = nil
+            selectedRemoteFile = filteredRemoteFiles.first
             statusMessage = "캐시된 루트 목록 \(cachedRootFiles.count)개 항목을 표시합니다."
             return
         }
@@ -172,7 +172,7 @@ final class AndroidDeviceViewModel {
            !forceRefresh,
            let cachedFiles = cachedFolderFiles[RemoteFolderKey(storageID: storageID, folderID: folderID)] {
             remoteFiles = cachedFiles
-            selectedRemoteFile = nil
+            selectedRemoteFile = filteredRemoteFiles.first
             statusMessage = "캐시된 폴더 목록 \(cachedFiles.count)개 항목을 표시합니다."
             return
         }
@@ -470,7 +470,7 @@ final class AndroidDeviceViewModel {
             cachedFolderFiles[folderKey] = files
         }
         remoteFiles = files
-        selectedRemoteFile = nil
+        selectedRemoteFile = filteredRemoteFiles.first
         statusMessage = "\(files.count)개 항목을 불러왔습니다."
         if directory == "/", !hasRemoteIndex {
             startRemoteIndexing()
@@ -499,7 +499,7 @@ final class AndroidDeviceViewModel {
                 cachedRootFiles = indexedRootFiles
                 if remoteDirectory == "/" {
                     remoteFiles = indexedRootFiles
-                    selectedRemoteFile = nil
+                    selectedRemoteFile = filteredRemoteFiles.first
                     statusMessage = "Android 인덱스 준비 완료 · \(indexedRootFiles.count)개 최상위 항목"
                 }
             } catch {
