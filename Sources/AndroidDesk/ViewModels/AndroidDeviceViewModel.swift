@@ -79,6 +79,7 @@ final class AndroidDeviceViewModel {
     var remoteSortOption: FileSortOption = .name
     var statusMessage = "준비됨"
     var isWorking = false
+    var isLoadingRemoteFiles = true
     var isIndexingRemoteFiles = false
     var transferProgress: Double?
     var transferBytes: UInt64 = 0
@@ -117,6 +118,7 @@ final class AndroidDeviceViewModel {
     func stop() {
         connectionGeneration = UUID()
         isConnected = false
+        isLoadingRemoteFiles = false
         markRemoteIndexStale()
         let service = service
         Task {
@@ -183,6 +185,7 @@ final class AndroidDeviceViewModel {
         guard !isWorking else { return }
         connectionGeneration = UUID()
         isConnected = false
+        isLoadingRemoteFiles = true
         isIndexingRemoteFiles = false
         deviceDescription = "MTP 기기를 확인하는 중…"
         resetRemoteNavigation()
@@ -192,7 +195,10 @@ final class AndroidDeviceViewModel {
 
         perform(status: "Android 기기를 확인하는 중…") {
             try await service.deviceInfo()
+        } onFinish: { [weak self] in
+            self?.isLoadingRemoteFiles = false
         } onSuccess: { [weak self] device in
+            self?.isLoadingRemoteFiles = true
             self?.deviceDescription = device.serialNumber.isEmpty
                 ? "MTP 연결됨 · \(device.displayName)"
                 : "MTP 연결됨 · \(device.displayName) · \(device.serialNumber)"
@@ -211,6 +217,7 @@ final class AndroidDeviceViewModel {
         }
 
         if remoteDirectory == "/", !forceRefresh, !cachedRootFiles.isEmpty {
+            isLoadingRemoteFiles = false
             remoteFiles = cachedRootFiles
             selectedRemoteFileIDs = Set(filteredRemoteFiles.prefix(1).map(\.id))
             statusMessage = "캐시된 루트 목록 \(cachedRootFiles.count)개 항목을 표시합니다."
@@ -221,6 +228,7 @@ final class AndroidDeviceViewModel {
            let folderID = remoteFolderID,
            !forceRefresh,
            let cachedFiles = cachedFolderFiles[RemoteFolderKey(storageID: storageID, folderID: folderID)] {
+            isLoadingRemoteFiles = false
             remoteFiles = cachedFiles
             selectedRemoteFileIDs = Set(filteredRemoteFiles.prefix(1).map(\.id))
             statusMessage = "캐시된 폴더 목록 \(cachedFiles.count)개 항목을 표시합니다."
@@ -229,6 +237,9 @@ final class AndroidDeviceViewModel {
 
         let directory = remoteDirectory
         let service = service
+        isLoadingRemoteFiles = true
+        remoteFiles = []
+        selectedRemoteFileIDs = []
         if let storageID = remoteStorageID, let folderID = remoteFolderID {
             perform(status: "Android 파일 목록을 읽는 중…") {
                 if forceRefresh {
@@ -238,6 +249,8 @@ final class AndroidDeviceViewModel {
                     .sorted { lhs, rhs in
                         lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
                     }
+            } onFinish: { [weak self] in
+                self?.isLoadingRemoteFiles = false
             } onSuccess: { [weak self] files in
                 self?.receiveRemoteFiles(
                     files,
@@ -253,6 +266,8 @@ final class AndroidDeviceViewModel {
                 return try await service.list(path: directory).sorted { lhs, rhs in
                     lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
                 }
+            } onFinish: { [weak self] in
+                self?.isLoadingRemoteFiles = false
             } onSuccess: { [weak self] files in
                 self?.receiveRemoteFiles(files, for: directory)
             }
@@ -800,6 +815,10 @@ final class AndroidDeviceViewModel {
                 let indexedRootFiles = try await service.refreshIndex().sorted { lhs, rhs in
                     lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
                 }
+                let indexedFolderFiles = try await buildIndexedFolderCache(
+                    rootFiles: indexedRootFiles,
+                    service: service
+                )
                 await Task.yield()
                 guard connectionGeneration == generation,
                       indexGeneration == requestedIndexGeneration,
@@ -807,6 +826,7 @@ final class AndroidDeviceViewModel {
                 isIndexingRemoteFiles = false
                 hasRemoteIndex = true
                 cachedRootFiles = indexedRootFiles
+                cachedFolderFiles.merge(indexedFolderFiles) { current, _ in current }
                 if remoteDirectory == "/" {
                     remoteFiles = indexedRootFiles
                     selectedRemoteFileIDs = Set(filteredRemoteFiles.prefix(1).map(\.id))
@@ -819,6 +839,31 @@ final class AndroidDeviceViewModel {
                 statusMessage = "빠른 목록 모드로 연결됨 · 전체 인덱스는 준비하지 못했습니다."
             }
         }
+    }
+
+    private func buildIndexedFolderCache(
+        rootFiles: [RemoteFile],
+        service: any MTPServicing
+    ) async throws -> [RemoteFolderKey: [RemoteFile]] {
+        var cache: [RemoteFolderKey: [RemoteFile]] = [:]
+        var pendingFolders = rootFiles.filter(\.isDirectory)
+        var visitedFolders: Set<RemoteFolderKey> = []
+
+        while let folder = pendingFolders.popLast() {
+            let key = RemoteFolderKey(storageID: folder.storageID, folderID: folder.objectID)
+            guard visitedFolders.insert(key).inserted else { continue }
+
+            let children = try await service.listChildren(
+                storageID: folder.storageID,
+                folderID: folder.objectID
+            ).sorted { lhs, rhs in
+                lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+            }
+            cache[key] = children
+            pendingFolders.append(contentsOf: children.filter(\.isDirectory))
+        }
+
+        return cache
     }
 
     private func markRemoteIndexStale() {

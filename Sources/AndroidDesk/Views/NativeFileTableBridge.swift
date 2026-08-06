@@ -15,13 +15,15 @@ struct NativeFileTableBridge: NSViewRepresentable {
     let onDragBegan: () -> Void
     let onDragEnded: () -> Void
     var editingRow: Int? = nil
+    var onCreateFolder: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
             dragWriters: dragWriters,
             onDragBegan: onDragBegan,
             onDragEnded: onDragEnded,
-            editingRow: editingRow
+            editingRow: editingRow,
+            onCreateFolder: onCreateFolder
         )
     }
 
@@ -35,6 +37,7 @@ struct NativeFileTableBridge: NSViewRepresentable {
         context.coordinator.dragWriters = dragWriters
         context.coordinator.onDragBegan = onDragBegan
         context.coordinator.onDragEnded = onDragEnded
+        context.coordinator.onCreateFolder = onCreateFolder
         context.coordinator.refreshEditingRow(editingRow)
     }
 
@@ -47,6 +50,7 @@ struct NativeFileTableBridge: NSViewRepresentable {
         var dragWriters: (IndexSet) -> [any NSPasteboardWriting]
         var onDragBegan: () -> Void
         var onDragEnded: () -> Void
+        var onCreateFolder: (() -> Void)?
         private var editingRow: Int?
         private weak var observedView: NSView?
         private weak var observedTableView: NSTableView?
@@ -59,12 +63,14 @@ struct NativeFileTableBridge: NSViewRepresentable {
             dragWriters: @escaping (IndexSet) -> [any NSPasteboardWriting],
             onDragBegan: @escaping () -> Void,
             onDragEnded: @escaping () -> Void,
-            editingRow: Int?
+            editingRow: Int?,
+            onCreateFolder: (() -> Void)?
         ) {
             self.dragWriters = dragWriters
             self.onDragBegan = onDragBegan
             self.onDragEnded = onDragEnded
             self.editingRow = editingRow
+            self.onCreateFolder = onCreateFolder
         }
 
         func startObserving(in view: NSView) {
@@ -179,9 +185,26 @@ struct NativeFileTableBridge: NSViewRepresentable {
                 mouseDownRow = nil
                 didStartDragging = false
 
+            case .rightMouseDown:
+                guard row < 0, onCreateFolder != nil else { return }
+                let menu = NSMenu()
+                let item = NSMenuItem(
+                    title: "새 폴더",
+                    action: #selector(createFolderFromContextMenu),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                menu.addItem(item)
+                NSMenu.popUpContextMenu(menu, with: event, for: tableView)
+                eventBox.shouldConsume = true
+
             default:
                 break
             }
+        }
+
+        @objc private func createFolderFromContextMenu() {
+            onCreateFolder?()
         }
 
         private func handleSelection(
@@ -193,6 +216,10 @@ struct NativeFileTableBridge: NSViewRepresentable {
             let modifiers = event.modifierFlags.intersection([.command, .shift])
             guard !modifiers.isEmpty else {
                 selectionAnchor = row
+                if !tableView.selectedRowIndexes.contains(row) {
+                    tableView.window?.makeFirstResponder(tableView)
+                    tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+                }
                 return
             }
 
@@ -268,15 +295,30 @@ struct NativeFileTableBridge: NSViewRepresentable {
         }
 
         private func tableView(at windowLocation: NSPoint) -> NSTableView? {
-            guard let contentView = observedView?.window?.contentView,
-                  let hitView = contentView.hitTest(windowLocation) else { return nil }
+            guard let contentView = observedView?.window?.contentView else { return nil }
 
-            var currentView: NSView? = hitView
-            while let current = currentView {
-                if let tableView = current as? NSTableView {
+            if let hitView = contentView.hitTest(windowLocation) {
+                var currentView: NSView? = hitView
+                while let current = currentView {
+                    if let tableView = current as? NSTableView {
+                        return tableView
+                    }
+                    currentView = current.superview
+                }
+            }
+            return tableView(containing: windowLocation, in: contentView)
+        }
+
+        private func tableView(containing windowLocation: NSPoint, in view: NSView) -> NSTableView? {
+            let location = view.convert(windowLocation, from: nil)
+            guard !view.isHidden, view.bounds.contains(location) else { return nil }
+            if let tableView = view as? NSTableView {
+                return tableView
+            }
+            for subview in view.subviews.reversed() {
+                if let tableView = tableView(containing: windowLocation, in: subview) {
                     return tableView
                 }
-                currentView = current.superview
             }
             return nil
         }

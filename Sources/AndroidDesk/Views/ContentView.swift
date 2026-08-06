@@ -43,6 +43,24 @@ private final class DroppedURLCollector: @unchecked Sendable {
     }
 }
 
+private struct RemoteTableRow: Identifiable {
+    let id: String
+    let file: RemoteFile?
+    let placeholderName: String
+
+    init(file: RemoteFile) {
+        id = file.id
+        self.file = file
+        placeholderName = file.name
+    }
+
+    init(placeholderIndex: Int, name: String) {
+        id = "android-loading-\(placeholderIndex)"
+        file = nil
+        placeholderName = name
+    }
+}
+
 struct ContentView: View {
     private enum NativeDragSource: Equatable {
         case local
@@ -281,64 +299,12 @@ struct ContentView: View {
                 prompt: "Android 파일 검색"
             )
 
-            Table(viewModel.filteredRemoteFiles, selection: $viewModel.selectedRemoteFileIDs) {
-                TableColumn("이름") { file in
-                    HStack {
-                        Image(systemName: file.isDirectory ? "folder" : "doc")
-                            .foregroundStyle(file.isDirectory ? .orange : .secondary)
-                        if renamingRemoteFileID == file.id {
-                            NativeInlineRenameField(
-                                initialText: file.name,
-                                onCommit: { name in
-                                    finishRemoteRename(file, name: name)
-                                },
-                                onCancel: {
-                                    cancelRemoteRename()
-                                }
-                            )
-                            .frame(maxWidth: .infinity, minHeight: 22, maxHeight: 24)
-                            .zIndex(1)
-                        } else {
-                            Text(file.name)
-                        }
-                        Spacer(minLength: 0)
-                    }
-                    .frame(
-                        maxWidth: .infinity,
-                        minHeight: 28,
-                        maxHeight: .infinity,
-                        alignment: .leading
-                    )
-                    .contentShape(Rectangle())
-                    .simultaneousGesture(
-                        TapGesture().onEnded {
-                            guard renamingRemoteFileID == nil else { return }
-                            handleRemoteClick(file)
-                        }
-                    )
-                    .contextMenu {
-                        Button("열기") {
-                            viewModel.selectedRemoteFileIDs = [file.id]
-                            viewModel.openRemoteFolder(file)
-                        }
-                        .disabled(!file.isDirectory)
-
-                        Divider()
-                        Button("새 폴더") {
-                            viewModel.createRemoteFolder()
-                        }
-                        Button("이름 변경…") {
-                            beginRemoteRename(file)
-                        }
-
-                        Divider()
-                        Button("삭제", role: .destructive) {
-                            cancelRemoteRename()
-                            if !viewModel.selectedRemoteFileIDs.contains(file.id) {
-                                viewModel.selectedRemoteFileIDs = [file.id]
-                            }
-                            viewModel.deleteSelectedRemoteFiles()
-                        }
+            Table(remoteTableRows, selection: remoteTableSelection) {
+                TableColumn("이름") { row in
+                    if let file = row.file {
+                        remoteFileRow(file)
+                    } else {
+                        remoteSkeletonRow(name: row.placeholderName)
                     }
                 }
                 .width(min: 100, ideal: 390, max: .infinity)
@@ -362,12 +328,15 @@ struct ContentView: View {
                     },
                     editingRow: renamingRemoteFileID.flatMap { fileID in
                         viewModel.filteredRemoteFiles.firstIndex { $0.id == fileID }
+                    },
+                    onCreateFolder: viewModel.isLoadingRemoteFiles ? nil : {
+                        viewModel.createRemoteFolder()
                     }
                 )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .overlay {
-                if isRemoteDropTargeted {
+                if isRemoteDropTargeted && !viewModel.isLoadingRemoteFiles {
                     RoundedRectangle(cornerRadius: 10)
                         .fill(Color.accentColor.opacity(0.14))
                         .overlay {
@@ -376,7 +345,9 @@ struct ContentView: View {
                                 .foregroundStyle(Color.accentColor)
                         }
                         .padding(4)
-                } else if viewModel.filteredRemoteFiles.isEmpty && !viewModel.isWorking {
+                } else if !viewModel.isLoadingRemoteFiles
+                            && viewModel.filteredRemoteFiles.isEmpty
+                            && !viewModel.isWorking {
                     ContentUnavailableView(
                         viewModel.remoteSearchText.isEmpty ? "표시할 파일이 없습니다" : "검색 결과가 없습니다",
                         systemImage: "folder",
@@ -414,6 +385,103 @@ struct ContentView: View {
             }
         }
         .padding()
+    }
+
+    private var remoteTableRows: [RemoteTableRow] {
+        if viewModel.isLoadingRemoteFiles {
+            let names = [
+                "Android 파일을 불러오는 중입니다",
+                "파일 이름을 확인하는 중",
+                "폴더 정보를 불러오는 중입니다",
+                "Android 저장소 항목을 확인하는 중",
+                "파일 정보를 불러오는 중",
+                "폴더 내용을 확인하는 중입니다",
+                "저장소 항목을 불러오는 중",
+                "파일 목록을 확인하는 중입니다"
+            ]
+            return names.enumerated().map {
+                RemoteTableRow(placeholderIndex: $0.offset, name: $0.element)
+            }
+        }
+        return viewModel.filteredRemoteFiles.map(RemoteTableRow.init(file:))
+    }
+
+    private var remoteTableSelection: Binding<Set<RemoteFile.ID>> {
+        Binding(
+            get: { viewModel.isLoadingRemoteFiles ? [] : viewModel.selectedRemoteFileIDs },
+            set: { selection in
+                guard !viewModel.isLoadingRemoteFiles else { return }
+                viewModel.selectedRemoteFileIDs = selection
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func remoteFileRow(_ file: RemoteFile) -> some View {
+        HStack {
+            Image(systemName: file.isDirectory ? "folder" : "doc")
+                .foregroundStyle(file.isDirectory ? .orange : .secondary)
+            if renamingRemoteFileID == file.id {
+                NativeInlineRenameField(
+                    initialText: file.name,
+                    onCommit: { name in
+                        finishRemoteRename(file, name: name)
+                    },
+                    onCancel: {
+                        cancelRemoteRename()
+                    }
+                )
+                .frame(maxWidth: .infinity, minHeight: 22, maxHeight: 24)
+                .zIndex(1)
+            } else {
+                Text(file.name)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, minHeight: 28, maxHeight: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .simultaneousGesture(
+            TapGesture().onEnded {
+                guard renamingRemoteFileID == nil else { return }
+                handleRemoteClick(file)
+            }
+        )
+        .contextMenu {
+            Button("열기") {
+                viewModel.selectedRemoteFileIDs = [file.id]
+                viewModel.openRemoteFolder(file)
+            }
+            .disabled(!file.isDirectory)
+
+            Button("이름 변경…") {
+                beginRemoteRename(file)
+            }
+
+            Divider()
+            Button("삭제", role: .destructive) {
+                cancelRemoteRename()
+                if !viewModel.selectedRemoteFileIDs.contains(file.id) {
+                    viewModel.selectedRemoteFileIDs = [file.id]
+                }
+                viewModel.deleteSelectedRemoteFiles()
+            }
+        }
+    }
+
+    private func remoteSkeletonRow(name: String) -> some View {
+        HStack(spacing: 10) {
+            NativeSkeletonPulseView(cornerRadius: 4)
+                .frame(width: 18, height: 18)
+            Text(name)
+                .hidden()
+                .overlay {
+                    NativeSkeletonPulseView(cornerRadius: 4)
+                        .frame(height: 12)
+                }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, minHeight: 28, maxHeight: .infinity, alignment: .leading)
+        .accessibilityHidden(true)
     }
 
     private var statusBar: some View {
