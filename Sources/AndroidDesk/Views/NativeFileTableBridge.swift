@@ -76,7 +76,7 @@ struct NativeFileTableBridge: NSViewRepresentable {
         func startObserving(in view: NSView) {
             observedView = view
             eventMonitor = NSEvent.addLocalMonitorForEvents(
-                matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp, .rightMouseDown]
+                matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp, .rightMouseDown, .keyDown]
             ) { [weak self] event in
                 let eventBox = TableEventBox(event)
                 MainActor.assumeIsolated {
@@ -132,7 +132,14 @@ struct NativeFileTableBridge: NSViewRepresentable {
         private func handle(_ eventBox: TableEventBox) {
             let event = eventBox.event
             guard let observedView,
-                  event.window === observedView.window,
+                  event.window === observedView.window else { return }
+
+            if event.type == .keyDown {
+                handleCreateFolderShortcut(event, eventBox: eventBox)
+                return
+            }
+
+            guard
                   observedView.bounds.contains(observedView.convert(event.locationInWindow, from: nil)),
                   !isTextEditingTarget(at: event.locationInWindow),
                   let tableView = tableView(at: event.locationInWindow) else { return }
@@ -205,6 +212,26 @@ struct NativeFileTableBridge: NSViewRepresentable {
 
         @objc private func createFolderFromContextMenu() {
             onCreateFolder?()
+        }
+
+        private func handleCreateFolderShortcut(_ event: NSEvent, eventBox: TableEventBox) {
+            let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+            guard modifiers == [.command, .shift],
+                  event.charactersIgnoringModifiers?.lowercased() == "n",
+                  let tableView = owningTableView(),
+                  isFirstResponder(inside: tableView),
+                  onCreateFolder != nil else { return }
+            onCreateFolder?()
+            eventBox.shouldConsume = true
+        }
+
+        private func isFirstResponder(inside tableView: NSTableView) -> Bool {
+            var responderView = tableView.window?.firstResponder as? NSView
+            while let view = responderView {
+                if view === tableView { return true }
+                responderView = view.superview
+            }
+            return false
         }
 
         private func handleSelection(

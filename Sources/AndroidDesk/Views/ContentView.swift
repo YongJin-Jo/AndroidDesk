@@ -80,6 +80,7 @@ struct ContentView: View {
     @State private var lastClickTarget: ClickTarget?
     @State private var lastClickDate: Date?
     @State private var nativeDragSource: NativeDragSource?
+    @State private var renamingLocalFileID: LocalFile.ID?
     @State private var renamingRemoteFileID: RemoteFile.ID?
 
     var body: some View {
@@ -103,6 +104,9 @@ struct ContentView: View {
         }
         .onChange(of: viewModel.remoteDirectory, initial: true) { _, path in
             remotePathInput = path
+        }
+        .onChange(of: viewModel.localDirectory) { _, _ in
+            cancelLocalRename()
         }
         .onDisappear {
             viewModel.stop()
@@ -154,6 +158,12 @@ struct ContentView: View {
                 Label("Mac의 파일", systemImage: "laptopcomputer")
                     .font(.headline)
                 Spacer()
+                Button {
+                    viewModel.createLocalFolder()
+                } label: {
+                    Label("새 폴더", systemImage: "folder.badge.plus")
+                }
+                .disabled(viewModel.isWorking)
                 Button("폴더 선택…") { viewModel.chooseLocalFolder() }
                     .disabled(viewModel.isWorking)
             }
@@ -185,7 +195,21 @@ struct ContentView: View {
                     HStack {
                         Image(systemName: file.isDirectory ? "folder" : "doc")
                             .foregroundStyle(file.isDirectory ? .orange : .secondary)
-                        Text(file.name)
+                        if renamingLocalFileID == file.id {
+                            NativeInlineRenameField(
+                                initialText: file.name,
+                                onCommit: { name in
+                                    finishLocalRename(file, name: name)
+                                },
+                                onCancel: {
+                                    cancelLocalRename()
+                                }
+                            )
+                            .frame(maxWidth: .infinity, minHeight: 22, maxHeight: 24)
+                            .zIndex(1)
+                        } else {
+                            Text(file.name)
+                        }
                         Spacer(minLength: 0)
                     }
                     .frame(
@@ -197,9 +221,30 @@ struct ContentView: View {
                     .contentShape(Rectangle())
                     .simultaneousGesture(
                         TapGesture().onEnded {
+                            guard renamingLocalFileID == nil else { return }
                             handleLocalClick(file)
                         }
                     )
+                    .contextMenu {
+                        Button("열기") {
+                            viewModel.selectedLocalFileIDs = [file.id]
+                            viewModel.openLocalFolder(file)
+                        }
+                        .disabled(!file.isDirectory)
+
+                        Button("이름 변경…") {
+                            beginLocalRename(file)
+                        }
+
+                        Divider()
+                        Button("휴지통으로 이동", role: .destructive) {
+                            cancelLocalRename()
+                            if !viewModel.selectedLocalFileIDs.contains(file.id) {
+                                viewModel.selectedLocalFileIDs = [file.id]
+                            }
+                            viewModel.deleteSelectedLocalFiles()
+                        }
+                    }
                 }
                 .width(min: 100, ideal: 350, max: .infinity)
             }
@@ -217,6 +262,12 @@ struct ContentView: View {
                     },
                     onDragEnded: {
                         nativeDragSource = nil
+                    },
+                    editingRow: renamingLocalFileID.flatMap { fileID in
+                        viewModel.filteredLocalFiles.firstIndex { $0.id == fileID }
+                    },
+                    onCreateFolder: {
+                        viewModel.createLocalFolder()
                     }
                 )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -235,10 +286,18 @@ struct ContentView: View {
                 return receiveFilesOnMac(from: providers)
             }
             .onKeyPress(.return) {
-                if viewModel.selectedLocalFiles.count == 1,
-                   let file = viewModel.selectedLocalFile {
-                    viewModel.openLocalFolder(file)
-                }
+                guard renamingLocalFileID == nil,
+                      viewModel.selectedLocalFiles.count == 1,
+                      let file = viewModel.selectedLocalFile,
+                      !viewModel.isWorking else { return .ignored }
+                beginLocalRename(file)
+                return .handled
+            }
+            .onKeyPress(.delete) {
+                guard renamingLocalFileID == nil,
+                      !viewModel.selectedLocalFiles.isEmpty,
+                      !viewModel.isWorking else { return .ignored }
+                viewModel.deleteSelectedLocalFiles()
                 return .handled
             }
 
@@ -273,7 +332,6 @@ struct ContentView: View {
                 } label: {
                     Label("새 폴더", systemImage: "folder.badge.plus")
                 }
-                .keyboardShortcut("n", modifiers: [.command, .shift])
                 .disabled(!viewModel.isConnected || viewModel.isWorking)
                 Button("목록 갱신") { viewModel.loadRemoteFiles(forceRefresh: true) }
                     .disabled(!viewModel.isConnected || viewModel.isWorking)
@@ -628,6 +686,23 @@ struct ContentView: View {
     private var remoteDownloadButtonTitle: String {
         let count = viewModel.selectedRemoteFiles.count
         return count > 1 ? "선택한 \(count)개 다운로드…" : "선택 항목 다운로드…"
+    }
+
+    private func beginLocalRename(_ file: LocalFile) {
+        guard !viewModel.isWorking else { return }
+        viewModel.selectedLocalFileIDs = [file.id]
+        renamingLocalFileID = file.id
+        resetClickTracking()
+    }
+
+    private func finishLocalRename(_ file: LocalFile, name: String) {
+        guard renamingLocalFileID == file.id else { return }
+        renamingLocalFileID = nil
+        viewModel.renameLocalFile(file, to: name)
+    }
+
+    private func cancelLocalRename() {
+        renamingLocalFileID = nil
     }
 
     private func beginRemoteRename(_ file: RemoteFile) {

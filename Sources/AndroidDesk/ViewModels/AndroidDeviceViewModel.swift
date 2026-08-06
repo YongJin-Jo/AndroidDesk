@@ -162,6 +162,87 @@ final class AndroidDeviceViewModel {
         loadLocalFiles()
     }
 
+    func createLocalFolder() {
+        guard !isWorking else { return }
+        guard let name = requestName(
+            title: "새 폴더",
+            message: "Mac의 현재 위치에 생성할 폴더 이름을 입력하세요.",
+            initialValue: "새 폴더"
+        ) else { return }
+
+        let folderURL = localDirectory.appendingPathComponent(name, isDirectory: true)
+        guard !FileManager.default.fileExists(atPath: folderURL.path) else {
+            showError(MTPError("\(name)과(와) 같은 이름의 항목이 이미 있습니다."))
+            return
+        }
+
+        do {
+            try FileManager.default.createDirectory(
+                at: folderURL,
+                withIntermediateDirectories: false
+            )
+            loadLocalFiles()
+            selectedLocalFileIDs = [folderURL]
+            statusMessage = "Mac에 \(name) 폴더를 만들었습니다."
+        } catch {
+            showError(error)
+        }
+    }
+
+    func renameLocalFile(_ file: LocalFile, to proposedName: String) {
+        guard !isWorking else { return }
+        let name = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isValidFileName(name) else {
+            showError(MTPError("이름은 비어 있을 수 없으며 '/'를 포함할 수 없습니다."))
+            return
+        }
+        guard name != file.name else { return }
+
+        let destination = file.url.deletingLastPathComponent()
+            .appendingPathComponent(name, isDirectory: file.isDirectory)
+        guard !FileManager.default.fileExists(atPath: destination.path) else {
+            showError(MTPError("\(name)과(와) 같은 이름의 항목이 이미 있습니다."))
+            return
+        }
+
+        do {
+            try FileManager.default.moveItem(at: file.url, to: destination)
+            loadLocalFiles()
+            selectedLocalFileIDs = [destination]
+            statusMessage = "\(file.name)의 이름을 \(name)(으)로 변경했습니다."
+        } catch {
+            showError(error)
+        }
+    }
+
+    func deleteSelectedLocalFiles() {
+        let files = selectedLocalFiles
+        guard !isWorking, !files.isEmpty else { return }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = files.count == 1
+            ? "\(files[0].name)을(를) 휴지통으로 이동하시겠습니까?"
+            : "선택한 \(files.count)개 항목을 휴지통으로 이동하시겠습니까?"
+        alert.informativeText = "Finder의 휴지통에서 다시 복원할 수 있습니다."
+        let deleteButton = alert.addButton(withTitle: "휴지통으로 이동")
+        deleteButton.hasDestructiveAction = true
+        alert.addButton(withTitle: "취소")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        do {
+            for file in files {
+                var resultingURL: NSURL?
+                try FileManager.default.trashItem(at: file.url, resultingItemURL: &resultingURL)
+            }
+            loadLocalFiles()
+            statusMessage = "Mac 항목 \(files.count)개를 휴지통으로 이동했습니다."
+        } catch {
+            loadLocalFiles()
+            showError(error)
+        }
+    }
+
     @discardableResult
     func chooseLocalFolder() -> Bool {
         let panel = NSOpenPanel()
@@ -335,7 +416,7 @@ final class AndroidDeviceViewModel {
 
     func createRemoteFolder() {
         guard isConnected, !isWorking else { return }
-        guard let name = requestRemoteName(
+        guard let name = requestName(
             title: "새 폴더",
             message: "Android의 현재 위치에 생성할 폴더 이름을 입력하세요.",
             initialValue: "새 폴더"
@@ -542,7 +623,7 @@ final class AndroidDeviceViewModel {
         }
     }
 
-    private func requestRemoteName(
+    private func requestName(
         title: String,
         message: String,
         initialValue: String
@@ -561,14 +642,15 @@ final class AndroidDeviceViewModel {
 
         guard alert.runModal() == .alertFirstButtonReturn else { return nil }
         let name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty,
-              name != ".",
-              name != "..",
-              !name.contains("/") else {
+        guard isValidFileName(name) else {
             showError(MTPError("이름은 비어 있을 수 없으며 '/'를 포함할 수 없습니다."))
             return nil
         }
         return name
+    }
+
+    private func isValidFileName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".." && !name.contains("/")
     }
 
     private func updateRemoteFile(_ file: RemoteFile, name: String) {
