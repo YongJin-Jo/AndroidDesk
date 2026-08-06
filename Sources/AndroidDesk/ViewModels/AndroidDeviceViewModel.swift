@@ -1,6 +1,19 @@
 import AppKit
 import Foundation
 import Observation
+import UniformTypeIdentifiers
+
+private final class FileRepresentationCompletion: @unchecked Sendable {
+    private let completion: (URL?, Bool, Error?) -> Void
+
+    init(_ completion: @escaping (URL?, Bool, Error?) -> Void) {
+        self.completion = completion
+    }
+
+    func callAsFunction(_ url: URL?, _ isInPlace: Bool, _ error: Error?) {
+        completion(url, isInPlace, error)
+    }
+}
 
 @MainActor
 @Observable
@@ -313,6 +326,77 @@ final class AndroidDeviceViewModel {
             self?.finishTransferProgress(for: transferID)
         } onSuccess: { [weak self] name in
             self?.statusMessage = "\(name)을(를) 다운로드했습니다."
+        }
+    }
+
+    func dragProvider(for file: RemoteFile) -> NSItemProvider {
+        let provider = NSItemProvider()
+        provider.suggestedName = file.name
+        let fileExtension = URL(fileURLWithPath: file.name).pathExtension
+        let contentType = file.isDirectory
+            ? UTType.folder
+            : UTType(filenameExtension: fileExtension) ?? UTType.data
+
+        provider.registerFileRepresentation(
+            forTypeIdentifier: contentType.identifier,
+            fileOptions: [],
+            visibility: .all
+        ) { [weak self] completion in
+            let progress = Progress(totalUnitCount: max(Int64(clamping: file.size), 1))
+            let completion = FileRepresentationCompletion(completion)
+
+            Task { @MainActor [weak self] in
+                guard let self else {
+                    completion(nil, false, CancellationError())
+                    return
+                }
+                guard !self.isWorking, self.isConnected else {
+                    completion(nil, false, MTPError("다른 전송 작업이 진행 중이거나 기기가 연결되어 있지 않습니다."))
+                    return
+                }
+
+                let temporaryDirectory = FileManager.default.temporaryDirectory
+                    .appendingPathComponent(UUID().uuidString, isDirectory: true)
+                let destination = temporaryDirectory
+                    .appendingPathComponent(file.name, isDirectory: file.isDirectory)
+                let transferID = self.beginTransferProgress()
+                self.isWorking = true
+                self.statusMessage = "\(file.name)을(를) Mac으로 전송하는 중…"
+
+                do {
+                    try FileManager.default.createDirectory(
+                        at: temporaryDirectory,
+                        withIntermediateDirectories: true
+                    )
+                    try await self.service.download(file: file, destination: destination) { [weak self] value in
+                        progress.totalUnitCount = max(Int64(clamping: value.totalBytes), 1)
+                        progress.completedUnitCount = Int64(clamping: value.bytesTransferred)
+                        Task { @MainActor [weak self] in
+                            self?.updateTransferProgress(value, for: transferID)
+                        }
+                    }
+                    self.isWorking = false
+                    self.finishTransferProgress(for: transferID)
+                    self.statusMessage = "\(file.name)을(를) Mac으로 전송했습니다."
+                    completion(destination, false, nil)
+                } catch {
+                    self.isWorking = false
+                    self.finishTransferProgress(for: transferID)
+                    self.showError(error)
+                    completion(nil, false, error)
+                }
+            }
+            return progress
+        }
+        return provider
+    }
+
+    func reportLocalDrop(name: String, error: Error?) {
+        if let error {
+            showError(error)
+        } else {
+            loadLocalFiles()
+            statusMessage = "\(name)을(를) Mac 폴더로 복사했습니다."
         }
     }
 

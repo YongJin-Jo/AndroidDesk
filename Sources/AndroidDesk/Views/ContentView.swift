@@ -3,6 +3,29 @@ import Observation
 import SwiftUI
 import UniformTypeIdentifiers
 
+private enum LocalDropCopier {
+    static func copy(_ source: URL, to directory: URL) -> (name: String, error: Error?) {
+        let hasSecurityAccess = source.startAccessingSecurityScopedResource()
+        defer {
+            if hasSecurityAccess {
+                source.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        let name = source.lastPathComponent
+        let destination = directory.appendingPathComponent(name)
+        do {
+            guard !FileManager.default.fileExists(atPath: destination.path) else {
+                throw MTPError("\(name)과(와) 같은 이름의 항목이 이미 있습니다.")
+            }
+            try FileManager.default.copyItem(at: source, to: destination)
+            return (name, nil)
+        } catch {
+            return (name, error)
+        }
+    }
+}
+
 struct ContentView: View {
     private enum ClickTarget: Equatable {
         case local(LocalFile.ID)
@@ -151,8 +174,8 @@ struct ContentView: View {
                     )
                 }
             }
-            .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
-                receiveFiles(from: providers)
+            .onDrop(of: [.fileURL, .data, .folder], isTargeted: $isDropTargeted) { providers in
+                receiveFilesOnMac(from: providers)
             }
             .onKeyPress(.return) {
                 if let file = viewModel.selectedLocalFile {
@@ -170,7 +193,7 @@ struct ContentView: View {
                     .disabled(viewModel.isWorking)
             }
 
-            Text("폴더를 두 번 클릭해 이동하거나, 파일·폴더를 오른쪽 Android 영역으로 끌어놓을 수 있습니다.")
+            Text("폴더를 두 번 클릭해 이동하거나, 파일·폴더를 양쪽 영역 또는 Finder로 끌어 전송할 수 있습니다.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -227,6 +250,9 @@ struct ContentView: View {
                             handleRemoteClick(file)
                         }
                     )
+                    .onDrag {
+                        viewModel.dragProvider(for: file)
+                    }
                 }
                 .width(min: 100, ideal: 390, max: .infinity)
             }
@@ -250,7 +276,7 @@ struct ContentView: View {
                 }
             }
             .onDrop(of: [.fileURL], isTargeted: $isRemoteDropTargeted) { providers in
-                receiveFiles(from: providers)
+                receiveFilesForUpload(from: providers)
             }
             .onKeyPress(.return) {
                 if let file = viewModel.selectedRemoteFile {
@@ -334,7 +360,7 @@ struct ContentView: View {
         }
     }
 
-    private func receiveFiles(from providers: [NSItemProvider]) -> Bool {
+    private func receiveFilesForUpload(from providers: [NSItemProvider]) -> Bool {
         for provider in providers {
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
                 guard let data = item as? Data,
@@ -343,6 +369,55 @@ struct ContentView: View {
             }
         }
         return !providers.isEmpty
+    }
+
+    private func receiveFilesOnMac(from providers: [NSItemProvider]) -> Bool {
+        let destinationDirectory = viewModel.localDirectory
+        let model = viewModel
+        let report: @Sendable (String, Error?) -> Void = { [weak model] name, error in
+            DispatchQueue.main.async {
+                model?.reportLocalDrop(name: name, error: error)
+            }
+        }
+        var acceptedProvider = false
+
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                acceptedProvider = true
+                provider.loadItem(
+                    forTypeIdentifier: UTType.fileURL.identifier,
+                    options: nil
+                ) { item, error in
+                    guard error == nil,
+                          let data = item as? Data,
+                          let url = URL(dataRepresentation: data, relativeTo: nil) else {
+                        report("파일", error ?? MTPError("드롭한 파일 위치를 읽을 수 없습니다."))
+                        return
+                    }
+                    let result = LocalDropCopier.copy(url, to: destinationDirectory)
+                    report(result.name, result.error)
+                }
+                continue
+            }
+
+            let typeIdentifier = [UTType.folder, UTType.data]
+                .map(\.identifier)
+                .first { provider.hasItemConformingToTypeIdentifier($0) }
+            guard let typeIdentifier else { continue }
+            acceptedProvider = true
+            provider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { url, error in
+                guard let url else {
+                    report(
+                        provider.suggestedName ?? "파일",
+                        error ?? MTPError("Android 파일을 다운로드할 수 없습니다.")
+                    )
+                    return
+                }
+                let result = LocalDropCopier.copy(url, to: destinationDirectory)
+                report(result.name, result.error)
+            }
+        }
+        return acceptedProvider
     }
 
     private var localSelection: Binding<LocalFile.ID?> {
