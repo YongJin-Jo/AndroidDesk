@@ -8,7 +8,8 @@ MTP로 연결된 Android 기기와 macOS 사이에서 파일을 전송하는 Swi
 - 사용자 홈 폴더에서 시작하는 Mac 파일 탐색 및 폴더 이동
 - Mac 파일 또는 폴더를 드래그앤드롭해 Android 폴더로 업로드
 - Android MTP 폴더 목록 보기
-- 선택한 Android 파일 또는 폴더를 Mac으로 다운로드
+- ⌘·Shift 다중 선택과 여러 파일·폴더 일괄 업로드/다운로드
+- Android 파일 또는 폴더를 Mac 영역·Finder로 드래그앤드롭해 다운로드
 
 ## 구조
 

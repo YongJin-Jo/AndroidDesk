@@ -138,7 +138,7 @@ struct ContentView: View {
                 prompt: "Mac 파일 검색"
             )
 
-            Table(viewModel.filteredLocalFiles, selection: localSelection) {
+            Table(viewModel.filteredLocalFiles, selection: $viewModel.selectedLocalFileIDs) {
                 TableColumn("이름") { file in
                     HStack {
                         Image(systemName: file.isDirectory ? "folder" : "doc")
@@ -165,6 +165,10 @@ struct ContentView: View {
                 .width(min: 100, ideal: 350, max: .infinity)
             }
             .tableColumnHeaders(.hidden)
+            .background {
+                NativeTableSelectionBridge()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
             .overlay {
                 if viewModel.filteredLocalFiles.isEmpty {
                     ContentUnavailableView(
@@ -178,22 +182,27 @@ struct ContentView: View {
                 receiveFilesOnMac(from: providers)
             }
             .onKeyPress(.return) {
-                if let file = viewModel.selectedLocalFile {
+                if viewModel.selectedLocalFiles.count == 1,
+                   let file = viewModel.selectedLocalFile {
                     viewModel.openLocalFolder(file)
                 }
                 return .handled
             }
 
             HStack {
-                Button("선택 항목 업로드") { viewModel.uploadSelectedLocalFile() }
-                    .disabled(viewModel.selectedLocalFile == nil || !viewModel.isConnected || viewModel.isWorking)
+                Button(localUploadButtonTitle) { viewModel.uploadSelectedLocalFiles() }
+                    .disabled(
+                        viewModel.selectedLocalFiles.isEmpty
+                            || !viewModel.isConnected
+                            || viewModel.isWorking
+                    )
                 Spacer()
                 Button("파일 선택…") { isImporting = true }
                     .buttonStyle(.borderedProminent)
                     .disabled(viewModel.isWorking)
             }
 
-            Text("폴더를 두 번 클릭해 이동하거나, 파일·폴더를 양쪽 영역 또는 Finder로 끌어 전송할 수 있습니다.")
+            Text("⌘·Shift로 여러 항목을 선택하거나, 파일·폴더를 양쪽 영역 또는 Finder로 끌어 전송할 수 있습니다.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -230,7 +239,7 @@ struct ContentView: View {
                 prompt: "Android 파일 검색"
             )
 
-            Table(viewModel.filteredRemoteFiles, selection: remoteSelection) {
+            Table(viewModel.filteredRemoteFiles, selection: $viewModel.selectedRemoteFileIDs) {
                 TableColumn("이름") { file in
                     HStack {
                         Image(systemName: file.isDirectory ? "folder" : "doc")
@@ -257,6 +266,10 @@ struct ContentView: View {
                 .width(min: 100, ideal: 390, max: .infinity)
             }
             .tableColumnHeaders(.hidden)
+            .background {
+                NativeTableSelectionBridge()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
             .overlay {
                 if isRemoteDropTargeted {
                     RoundedRectangle(cornerRadius: 10)
@@ -279,15 +292,16 @@ struct ContentView: View {
                 receiveFilesForUpload(from: providers)
             }
             .onKeyPress(.return) {
-                if let file = viewModel.selectedRemoteFile {
+                if viewModel.selectedRemoteFiles.count == 1,
+                   let file = viewModel.selectedRemoteFile {
                     viewModel.openRemoteFolder(file)
                 }
                 return .handled
             }
 
             HStack {
-                Button("선택 항목 다운로드…") { viewModel.downloadSelectedFile() }
-                    .disabled(viewModel.selectedRemoteFile == nil || viewModel.isWorking)
+                Button(remoteDownloadButtonTitle) { viewModel.downloadSelectedFiles() }
+                    .disabled(viewModel.selectedRemoteFiles.isEmpty || viewModel.isWorking)
                 Spacer()
                 Button("여기로 업로드") { isImporting = true }
                     .buttonStyle(.borderedProminent)
@@ -420,36 +434,45 @@ struct ContentView: View {
         return acceptedProvider
     }
 
-    private var localSelection: Binding<LocalFile.ID?> {
-        Binding(
-            get: { viewModel.selectedLocalFile?.id },
-            set: { id in
-                viewModel.selectedLocalFile = viewModel.filteredLocalFiles.first { $0.id == id }
-            }
-        )
+    private var localUploadButtonTitle: String {
+        let count = viewModel.selectedLocalFiles.count
+        return count > 1 ? "선택한 \(count)개 업로드" : "선택 항목 업로드"
     }
 
-    private var remoteSelection: Binding<RemoteFile.ID?> {
-        Binding(
-            get: { viewModel.selectedRemoteFile?.id },
-            set: { id in
-                viewModel.selectedRemoteFile = viewModel.filteredRemoteFiles.first { $0.id == id }
-            }
-        )
+    private var remoteDownloadButtonTitle: String {
+        let count = viewModel.selectedRemoteFiles.count
+        return count > 1 ? "선택한 \(count)개 다운로드…" : "선택 항목 다운로드…"
     }
 
     private func handleLocalClick(_ file: LocalFile) {
-        viewModel.selectedLocalFile = file
+        guard !isModifiedSelection else {
+            resetClickTracking()
+            return
+        }
+        viewModel.selectedLocalFileIDs = [file.id]
         if registerClick(on: .local(file.id)) {
             viewModel.openLocalFolder(file)
         }
     }
 
     private func handleRemoteClick(_ file: RemoteFile) {
-        viewModel.selectedRemoteFile = file
+        guard !isModifiedSelection else {
+            resetClickTracking()
+            return
+        }
+        viewModel.selectedRemoteFileIDs = [file.id]
         if registerClick(on: .remote(file.id)) {
             viewModel.openRemoteFolder(file)
         }
+    }
+
+    private var isModifiedSelection: Bool {
+        !NSEvent.modifierFlags.intersection([.command, .shift]).isEmpty
+    }
+
+    private func resetClickTracking() {
+        lastClickTarget = nil
+        lastClickDate = nil
     }
 
     private func registerClick(on target: ClickTarget) -> Bool {
@@ -458,8 +481,7 @@ struct ContentView: View {
             && now.timeIntervalSince(lastClickDate ?? .distantPast) <= NSEvent.doubleClickInterval
 
         if isDoubleClick {
-            lastClickTarget = nil
-            lastClickDate = nil
+            resetClickTracking()
         } else {
             lastClickTarget = target
             lastClickDate = now

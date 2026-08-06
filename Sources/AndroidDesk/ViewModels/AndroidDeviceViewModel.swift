@@ -35,12 +35,12 @@ final class AndroidDeviceViewModel {
     var isConnected = false
     var localDirectory = FileManager.default.homeDirectoryForCurrentUser
     var localFiles: [LocalFile] = []
-    var selectedLocalFile: LocalFile?
+    var selectedLocalFileIDs: Set<LocalFile.ID> = []
     var localSearchText = ""
     var localSortOption: FileSortOption = .name
     var remoteDirectory = "/"
     var remoteFiles: [RemoteFile] = []
-    var selectedRemoteFile: RemoteFile?
+    var selectedRemoteFileIDs: Set<RemoteFile.ID> = []
     var remoteSearchText = ""
     var remoteSortOption: FileSortOption = .name
     var statusMessage = "준비됨"
@@ -104,7 +104,7 @@ final class AndroidDeviceViewModel {
                     size: UInt64(values.fileSize ?? 0)
                 )
             }
-            selectedLocalFile = filteredLocalFiles.first
+            selectedLocalFileIDs = Set(filteredLocalFiles.prefix(1).map(\.id))
         } catch {
             showError(error)
         }
@@ -150,7 +150,7 @@ final class AndroidDeviceViewModel {
         deviceDescription = "MTP 기기를 확인하는 중…"
         resetRemoteNavigation()
         remoteFiles = []
-        selectedRemoteFile = nil
+        selectedRemoteFileIDs = []
         let service = service
 
         perform(status: "Android 기기를 확인하는 중…") {
@@ -175,7 +175,7 @@ final class AndroidDeviceViewModel {
 
         if remoteDirectory == "/", !forceRefresh, !cachedRootFiles.isEmpty {
             remoteFiles = cachedRootFiles
-            selectedRemoteFile = filteredRemoteFiles.first
+            selectedRemoteFileIDs = Set(filteredRemoteFiles.prefix(1).map(\.id))
             statusMessage = "캐시된 루트 목록 \(cachedRootFiles.count)개 항목을 표시합니다."
             return
         }
@@ -185,7 +185,7 @@ final class AndroidDeviceViewModel {
            !forceRefresh,
            let cachedFiles = cachedFolderFiles[RemoteFolderKey(storageID: storageID, folderID: folderID)] {
             remoteFiles = cachedFiles
-            selectedRemoteFile = filteredRemoteFiles.first
+            selectedRemoteFileIDs = Set(filteredRemoteFiles.prefix(1).map(\.id))
             statusMessage = "캐시된 폴더 목록 \(cachedFiles.count)개 항목을 표시합니다."
             return
         }
@@ -270,7 +270,19 @@ final class AndroidDeviceViewModel {
         }, by: remoteSortOption)
     }
 
+    var selectedLocalFiles: [LocalFile] {
+        filteredLocalFiles.filter { selectedLocalFileIDs.contains($0.id) }
+    }
+
+    var selectedRemoteFiles: [RemoteFile] {
+        filteredRemoteFiles.filter { selectedRemoteFileIDs.contains($0.id) }
+    }
+
+    var selectedLocalFile: LocalFile? { selectedLocalFiles.first }
+    var selectedRemoteFile: RemoteFile? { selectedRemoteFiles.first }
+
     func upload(urls: [URL]) {
+        guard !urls.isEmpty else { return }
         guard !isWorking else { return }
         guard isConnected else { refreshDevice(); return }
         let destination = remoteDirectory
@@ -304,28 +316,30 @@ final class AndroidDeviceViewModel {
         }
     }
 
-    func uploadSelectedLocalFile() {
-        guard let file = selectedLocalFile else { return }
-        upload(urls: [file.url])
+    func uploadSelectedLocalFiles() {
+        upload(urls: selectedLocalFiles.map(\.url))
     }
 
-    func downloadSelectedFile() {
-        guard !isWorking, isConnected, let file = selectedRemoteFile else { return }
-        guard let destination = selectDownloadDestination(for: file) else { return }
+    func downloadSelectedFiles() {
+        let files = selectedRemoteFiles
+        guard !isWorking, isConnected, !files.isEmpty else { return }
+        guard let downloads = selectDownloadDestinations(for: files) else { return }
         let service = service
         let transferID = beginTransferProgress()
 
-        perform(status: "파일을 Mac으로 다운로드하는 중…") {
-            try await service.download(file: file, destination: destination) { [weak self] progress in
-                Task { @MainActor [weak self] in
-                    self?.updateTransferProgress(progress, for: transferID)
+        perform(status: "\(files.count)개 항목을 Mac으로 다운로드하는 중…") {
+            for (file, destination) in downloads {
+                try await service.download(file: file, destination: destination) { [weak self] progress in
+                    Task { @MainActor [weak self] in
+                        self?.updateTransferProgress(progress, for: transferID)
+                    }
                 }
             }
-            return file.name
+            return files.count
         } onFinish: { [weak self] in
             self?.finishTransferProgress(for: transferID)
-        } onSuccess: { [weak self] name in
-            self?.statusMessage = "\(name)을(를) 다운로드했습니다."
+        } onSuccess: { [weak self] count in
+            self?.statusMessage = "\(count)개 항목을 다운로드했습니다."
         }
     }
 
@@ -420,6 +434,27 @@ final class AndroidDeviceViewModel {
         panel.directoryURL = downloads
         guard panel.runModal() == .OK else { return nil }
         return panel.url
+    }
+
+    private func selectDownloadDestinations(for files: [RemoteFile]) -> [(RemoteFile, URL)]? {
+        guard files.count > 1 else {
+            guard let file = files.first,
+                  let destination = selectDownloadDestination(for: file) else { return nil }
+            return [(file, destination)]
+        }
+
+        let panel = NSOpenPanel()
+        panel.title = "\(files.count)개 항목을 다운로드할 폴더 선택"
+        panel.prompt = "선택"
+        panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let directory = panel.url else { return nil }
+        return files.map { file in
+            (file, directory.appendingPathComponent(file.name, isDirectory: file.isDirectory))
+        }
     }
 
     private func perform<T: Sendable>(
@@ -554,7 +589,7 @@ final class AndroidDeviceViewModel {
             cachedFolderFiles[folderKey] = files
         }
         remoteFiles = files
-        selectedRemoteFile = filteredRemoteFiles.first
+        selectedRemoteFileIDs = Set(filteredRemoteFiles.prefix(1).map(\.id))
         statusMessage = "\(files.count)개 항목을 불러왔습니다."
         if directory == "/", !hasRemoteIndex {
             startRemoteIndexing()
@@ -583,7 +618,7 @@ final class AndroidDeviceViewModel {
                 cachedRootFiles = indexedRootFiles
                 if remoteDirectory == "/" {
                     remoteFiles = indexedRootFiles
-                    selectedRemoteFile = filteredRemoteFiles.first
+                    selectedRemoteFileIDs = Set(filteredRemoteFiles.prefix(1).map(\.id))
                     statusMessage = "Android 인덱스 준비 완료 · \(indexedRootFiles.count)개 최상위 항목"
                 }
             } catch {
