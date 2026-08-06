@@ -4,10 +4,9 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ContentView: View {
-    private enum SearchField: Hashable {
-        case local
-        case remote
-        case remotePath
+    private enum ClickTarget: Equatable {
+        case local(LocalFile.ID)
+        case remote(RemoteFile.ID)
     }
 
     @Bindable var viewModel: AndroidDeviceViewModel
@@ -15,7 +14,8 @@ struct ContentView: View {
     @State private var isDropTargeted = false
     @State private var isRemoteDropTargeted = false
     @State private var remotePathInput = "/"
-    @FocusState private var focusedSearchField: SearchField?
+    @State private var lastClickTarget: ClickTarget?
+    @State private var lastClickDate: Date?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -112,8 +112,7 @@ struct ContentView: View {
             fileControls(
                 searchText: $viewModel.localSearchText,
                 sortOption: $viewModel.localSortOption,
-                prompt: "Mac 파일 검색",
-                field: .local
+                prompt: "Mac 파일 검색"
             )
 
             Table(viewModel.filteredLocalFiles, selection: localSelection) {
@@ -124,15 +123,23 @@ struct ContentView: View {
                         Text(file.name)
                         Spacer(minLength: 0)
                     }
-                    .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: 28,
+                        maxHeight: .infinity,
+                        alignment: .leading
+                    )
                     .contentShape(Rectangle())
-                    .onTapGesture(count: 2) {
-                        viewModel.openLocalFolder(file)
-                    }
+                    .simultaneousGesture(
+                        TapGesture().onEnded {
+                            handleLocalClick(file)
+                        }
+                    )
                     .onDrag {
                         NSItemProvider(object: file.url as NSURL)
                     }
                 }
+                .width(min: 100, ideal: 350, max: .infinity)
             }
             .tableColumnHeaders(.hidden)
             .overlay {
@@ -191,23 +198,13 @@ struct ContentView: View {
 
                 TextField("MTP 폴더 (예: /Download)", text: $remotePathInput)
                     .textFieldStyle(.roundedBorder)
-                    .focused($focusedSearchField, equals: .remotePath)
-                    .onKeyPress(.upArrow) {
-                        moveRemoteSelection(by: -1)
-                        return .handled
-                    }
-                    .onKeyPress(.downArrow) {
-                        moveRemoteSelection(by: 1)
-                        return .handled
-                    }
                     .onSubmit { viewModel.openRemotePath(remotePathInput) }
             }
 
             fileControls(
                 searchText: $viewModel.remoteSearchText,
                 sortOption: $viewModel.remoteSortOption,
-                prompt: "Android 파일 검색",
-                field: .remote
+                prompt: "Android 파일 검색"
             )
 
             Table(viewModel.filteredRemoteFiles, selection: remoteSelection) {
@@ -218,12 +215,20 @@ struct ContentView: View {
                         Text(file.name)
                         Spacer(minLength: 0)
                     }
-                    .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: 28,
+                        maxHeight: .infinity,
+                        alignment: .leading
+                    )
                     .contentShape(Rectangle())
-                    .onTapGesture(count: 2) {
-                        viewModel.openRemoteFolder(file)
-                    }
+                    .simultaneousGesture(
+                        TapGesture().onEnded {
+                            handleRemoteClick(file)
+                        }
+                    )
                 }
+                .width(min: 100, ideal: 390, max: .infinity)
             }
             .tableColumnHeaders(.hidden)
             .overlay {
@@ -314,21 +319,11 @@ struct ContentView: View {
     private func fileControls(
         searchText: Binding<String>,
         sortOption: Binding<FileSortOption>,
-        prompt: String,
-        field: SearchField
+        prompt: String
     ) -> some View {
         HStack(spacing: 8) {
             TextField(prompt, text: searchText)
                 .textFieldStyle(.roundedBorder)
-                .focused($focusedSearchField, equals: field)
-                .onKeyPress(.upArrow) {
-                    moveSelection(for: field, by: -1)
-                    return .handled
-                }
-                .onKeyPress(.downArrow) {
-                    moveSelection(for: field, by: 1)
-                    return .handled
-                }
             Picker("정렬", selection: sortOption) {
                 ForEach(FileSortOption.allCases) { option in
                     Text(option.rawValue).tag(option)
@@ -368,38 +363,32 @@ struct ContentView: View {
         )
     }
 
-    private func moveSelection(for field: SearchField, by offset: Int) {
-        switch field {
-        case .local:
-            moveLocalSelection(by: offset)
-        case .remote, .remotePath:
-            moveRemoteSelection(by: offset)
+    private func handleLocalClick(_ file: LocalFile) {
+        viewModel.selectedLocalFile = file
+        if registerClick(on: .local(file.id)) {
+            viewModel.openLocalFolder(file)
         }
     }
 
-    private func moveLocalSelection(by offset: Int) {
-        guard let index = movedIndex(
-            in: viewModel.filteredLocalFiles,
-            selected: viewModel.selectedLocalFile,
-            by: offset
-        ) else { return }
-        viewModel.selectedLocalFile = viewModel.filteredLocalFiles[index]
-    }
-
-    private func moveRemoteSelection(by offset: Int) {
-        guard let index = movedIndex(
-            in: viewModel.filteredRemoteFiles,
-            selected: viewModel.selectedRemoteFile,
-            by: offset
-        ) else { return }
-        viewModel.selectedRemoteFile = viewModel.filteredRemoteFiles[index]
-    }
-
-    private func movedIndex<Item: Hashable>(in items: [Item], selected: Item?, by offset: Int) -> Int? {
-        guard !items.isEmpty else { return nil }
-        guard let selected, let currentIndex = items.firstIndex(of: selected) else {
-            return offset > 0 ? 0 : items.count - 1
+    private func handleRemoteClick(_ file: RemoteFile) {
+        viewModel.selectedRemoteFile = file
+        if registerClick(on: .remote(file.id)) {
+            viewModel.openRemoteFolder(file)
         }
-        return min(max(currentIndex + offset, 0), items.count - 1)
+    }
+
+    private func registerClick(on target: ClickTarget) -> Bool {
+        let now = Date()
+        let isDoubleClick = lastClickTarget == target
+            && now.timeIntervalSince(lastClickDate ?? .distantPast) <= NSEvent.doubleClickInterval
+
+        if isDoubleClick {
+            lastClickTarget = nil
+            lastClickDate = nil
+        } else {
+            lastClickTarget = target
+            lastClickDate = now
+        }
+        return isDoubleClick
     }
 }
