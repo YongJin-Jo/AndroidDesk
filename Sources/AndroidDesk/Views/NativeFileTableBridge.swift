@@ -14,12 +14,14 @@ struct NativeFileTableBridge: NSViewRepresentable {
     let dragWriters: (IndexSet) -> [any NSPasteboardWriting]
     let onDragBegan: () -> Void
     let onDragEnded: () -> Void
+    var editingRow: Int? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
             dragWriters: dragWriters,
             onDragBegan: onDragBegan,
-            onDragEnded: onDragEnded
+            onDragEnded: onDragEnded,
+            editingRow: editingRow
         )
     }
 
@@ -33,6 +35,7 @@ struct NativeFileTableBridge: NSViewRepresentable {
         context.coordinator.dragWriters = dragWriters
         context.coordinator.onDragBegan = onDragBegan
         context.coordinator.onDragEnded = onDragEnded
+        context.coordinator.refreshEditingRow(editingRow)
     }
 
     static func dismantleNSView(_ nsView: PassthroughView, coordinator: Coordinator) {
@@ -44,7 +47,9 @@ struct NativeFileTableBridge: NSViewRepresentable {
         var dragWriters: (IndexSet) -> [any NSPasteboardWriting]
         var onDragBegan: () -> Void
         var onDragEnded: () -> Void
+        private var editingRow: Int?
         private weak var observedView: NSView?
+        private weak var observedTableView: NSTableView?
         private var eventMonitor: Any?
         private var selectionAnchor: Int?
         private var mouseDownRow: Int?
@@ -53,17 +58,19 @@ struct NativeFileTableBridge: NSViewRepresentable {
         init(
             dragWriters: @escaping (IndexSet) -> [any NSPasteboardWriting],
             onDragBegan: @escaping () -> Void,
-            onDragEnded: @escaping () -> Void
+            onDragEnded: @escaping () -> Void,
+            editingRow: Int?
         ) {
             self.dragWriters = dragWriters
             self.onDragBegan = onDragBegan
             self.onDragEnded = onDragEnded
+            self.editingRow = editingRow
         }
 
         func startObserving(in view: NSView) {
             observedView = view
             eventMonitor = NSEvent.addLocalMonitorForEvents(
-                matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]
+                matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp, .rightMouseDown]
             ) { [weak self] event in
                 let eventBox = TableEventBox(event)
                 MainActor.assumeIsolated {
@@ -94,12 +101,36 @@ struct NativeFileTableBridge: NSViewRepresentable {
             onDragEnded()
         }
 
+        func refreshEditingRow(_ newEditingRow: Int?) {
+            guard editingRow != newEditingRow else { return }
+            let previousEditingRow = editingRow
+            editingRow = newEditingRow
+            guard let tableView = owningTableView() else { return }
+
+            var rows = IndexSet()
+            if let previousEditingRow,
+               tableView.numberOfRows > previousEditingRow {
+                rows.insert(previousEditingRow)
+            }
+            if let newEditingRow,
+               tableView.numberOfRows > newEditingRow {
+                rows.insert(newEditingRow)
+            }
+            guard !rows.isEmpty, tableView.numberOfColumns > 0 else { return }
+            tableView.reloadData(
+                forRowIndexes: rows,
+                columnIndexes: IndexSet(integersIn: 0..<tableView.numberOfColumns)
+            )
+        }
+
         private func handle(_ eventBox: TableEventBox) {
             let event = eventBox.event
             guard let observedView,
                   event.window === observedView.window,
                   observedView.bounds.contains(observedView.convert(event.locationInWindow, from: nil)),
+                  !isTextEditingTarget(at: event.locationInWindow),
                   let tableView = tableView(at: event.locationInWindow) else { return }
+            observedTableView = tableView
 
             let tableLocation = tableView.convert(event.locationInWindow, from: nil)
             let row = tableView.row(at: tableLocation)
@@ -248,6 +279,34 @@ struct NativeFileTableBridge: NSViewRepresentable {
                 currentView = current.superview
             }
             return nil
+        }
+
+        private func owningTableView() -> NSTableView? {
+            if let observedTableView {
+                return observedTableView
+            }
+            var currentView = observedView?.superview
+            while let current = currentView {
+                if let tableView = current as? NSTableView {
+                    return tableView
+                }
+                currentView = current.superview
+            }
+            return nil
+        }
+
+        private func isTextEditingTarget(at windowLocation: NSPoint) -> Bool {
+            guard let contentView = observedView?.window?.contentView,
+                  let hitView = contentView.hitTest(windowLocation) else { return false }
+
+            var currentView: NSView? = hitView
+            while let current = currentView {
+                if current is NSTextField || current is NSTextView {
+                    return true
+                }
+                currentView = current.superview
+            }
+            return false
         }
     }
 

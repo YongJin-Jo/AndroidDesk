@@ -348,15 +348,17 @@ final class AndroidDeviceViewModel {
         }
     }
 
-    func renameSelectedRemoteFile() {
-        guard isConnected, !isWorking,
-              selectedRemoteFiles.count == 1,
-              let file = selectedRemoteFile else { return }
-        guard let name = requestRemoteName(
-            title: "이름 변경",
-            message: "Android 항목의 새 이름을 입력하세요.",
-            initialValue: file.name
-        ), name != file.name else { return }
+    func renameRemoteFile(_ file: RemoteFile, to proposedName: String) {
+        guard isConnected, !isWorking else { return }
+        let name = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty,
+              name != ".",
+              name != "..",
+              !name.contains("/") else {
+            showError(MTPError("이름은 비어 있을 수 없으며 '/'를 포함할 수 없습니다."))
+            return
+        }
+        guard name != file.name else { return }
         guard !remoteFiles.contains(where: {
             $0.objectID != file.objectID && $0.name == name
         }) else {
@@ -364,13 +366,26 @@ final class AndroidDeviceViewModel {
             return
         }
 
+        updateRemoteFile(file, name: name)
+        isWorking = true
+        statusMessage = "\(file.name)의 이름을 \(name)(으)로 변경하는 중…"
         let service = service
-        perform(status: "\(file.name)의 이름을 변경하는 중…") {
-            try await service.rename(file: file, to: name)
-        } onSuccess: { [weak self] _ in
-            self?.markRemoteIndexStale()
-            self?.statusMessage = "\(file.name)의 이름을 \(name)(으)로 변경했습니다."
-            self?.scheduleRemoteReload()
+        Task { [weak self] in
+            do {
+                try await service.rename(file: file, to: name)
+                await Task.yield()
+                guard let self else { return }
+                self.isWorking = false
+                self.markRemoteIndexStale()
+                self.statusMessage = "\(file.name)의 이름을 \(name)(으)로 변경했습니다."
+                self.scheduleRemoteReload()
+            } catch {
+                await Task.yield()
+                guard let self else { return }
+                self.isWorking = false
+                self.updateRemoteFile(file, name: file.name)
+                self.showError(error)
+            }
         }
     }
 
@@ -539,6 +554,24 @@ final class AndroidDeviceViewModel {
             return nil
         }
         return name
+    }
+
+    private func updateRemoteFile(_ file: RemoteFile, name: String) {
+        let updatedFile = RemoteFile(
+            objectID: file.objectID,
+            storageID: file.storageID,
+            name: name,
+            isDirectory: file.isDirectory,
+            size: file.size
+        )
+        let replace: (RemoteFile) -> RemoteFile = { candidate in
+            candidate.objectID == file.objectID && candidate.storageID == file.storageID
+                ? updatedFile
+                : candidate
+        }
+        remoteFiles = remoteFiles.map(replace)
+        cachedRootFiles = cachedRootFiles.map(replace)
+        cachedFolderFiles = cachedFolderFiles.mapValues { $0.map(replace) }
     }
 
     private func selectDownloadDestination(for file: RemoteFile) -> URL? {

@@ -62,6 +62,7 @@ struct ContentView: View {
     @State private var lastClickTarget: ClickTarget?
     @State private var lastClickDate: Date?
     @State private var nativeDragSource: NativeDragSource?
+    @State private var renamingRemoteFileID: RemoteFile.ID?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -285,7 +286,21 @@ struct ContentView: View {
                     HStack {
                         Image(systemName: file.isDirectory ? "folder" : "doc")
                             .foregroundStyle(file.isDirectory ? .orange : .secondary)
-                        Text(file.name)
+                        if renamingRemoteFileID == file.id {
+                            NativeInlineRenameField(
+                                initialText: file.name,
+                                onCommit: { name in
+                                    finishRemoteRename(file, name: name)
+                                },
+                                onCancel: {
+                                    cancelRemoteRename()
+                                }
+                            )
+                            .frame(maxWidth: .infinity, minHeight: 22, maxHeight: 24)
+                            .zIndex(1)
+                        } else {
+                            Text(file.name)
+                        }
                         Spacer(minLength: 0)
                     }
                     .frame(
@@ -297,6 +312,7 @@ struct ContentView: View {
                     .contentShape(Rectangle())
                     .simultaneousGesture(
                         TapGesture().onEnded {
+                            guard renamingRemoteFileID == nil else { return }
                             handleRemoteClick(file)
                         }
                     )
@@ -312,12 +328,12 @@ struct ContentView: View {
                             viewModel.createRemoteFolder()
                         }
                         Button("이름 변경…") {
-                            viewModel.selectedRemoteFileIDs = [file.id]
-                            viewModel.renameSelectedRemoteFile()
+                            beginRemoteRename(file)
                         }
 
                         Divider()
                         Button("삭제", role: .destructive) {
+                            cancelRemoteRename()
                             if !viewModel.selectedRemoteFileIDs.contains(file.id) {
                                 viewModel.selectedRemoteFileIDs = [file.id]
                             }
@@ -343,6 +359,9 @@ struct ContentView: View {
                     },
                     onDragEnded: {
                         nativeDragSource = nil
+                    },
+                    editingRow: renamingRemoteFileID.flatMap { fileID in
+                        viewModel.filteredRemoteFiles.firstIndex { $0.id == fileID }
                     }
                 )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -370,13 +389,16 @@ struct ContentView: View {
                 return receiveFilesForUpload(from: providers)
             }
             .onKeyPress(.return) {
-                guard viewModel.selectedRemoteFiles.count == 1,
+                guard renamingRemoteFileID == nil,
+                      viewModel.selectedRemoteFiles.count == 1,
+                      let file = viewModel.selectedRemoteFile,
                       !viewModel.isWorking else { return .ignored }
-                viewModel.renameSelectedRemoteFile()
+                beginRemoteRename(file)
                 return .handled
             }
             .onKeyPress(.delete) {
-                guard !viewModel.selectedRemoteFiles.isEmpty,
+                guard renamingRemoteFileID == nil,
+                      !viewModel.selectedRemoteFiles.isEmpty,
                       !viewModel.isWorking else { return .ignored }
                 viewModel.deleteSelectedRemoteFiles()
                 return .handled
@@ -538,6 +560,23 @@ struct ContentView: View {
     private var remoteDownloadButtonTitle: String {
         let count = viewModel.selectedRemoteFiles.count
         return count > 1 ? "선택한 \(count)개 다운로드…" : "선택 항목 다운로드…"
+    }
+
+    private func beginRemoteRename(_ file: RemoteFile) {
+        guard viewModel.isConnected, !viewModel.isWorking else { return }
+        viewModel.selectedRemoteFileIDs = [file.id]
+        renamingRemoteFileID = file.id
+        resetClickTracking()
+    }
+
+    private func finishRemoteRename(_ file: RemoteFile, name: String) {
+        guard renamingRemoteFileID == file.id else { return }
+        renamingRemoteFileID = nil
+        viewModel.renameRemoteFile(file, to: name)
+    }
+
+    private func cancelRemoteRename() {
+        renamingRemoteFileID = nil
     }
 
     private func handleLocalClick(_ file: LocalFile) {
