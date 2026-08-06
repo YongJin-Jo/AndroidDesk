@@ -249,6 +249,13 @@ struct ContentView: View {
                 Label("Android 파일", systemImage: "internaldrive")
                     .font(.headline)
                 Spacer()
+                Button {
+                    viewModel.createRemoteFolder()
+                } label: {
+                    Label("새 폴더", systemImage: "folder.badge.plus")
+                }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
+                .disabled(!viewModel.isConnected || viewModel.isWorking)
                 Button("목록 갱신") { viewModel.loadRemoteFiles(forceRefresh: true) }
                     .disabled(!viewModel.isConnected || viewModel.isWorking)
             }
@@ -293,6 +300,30 @@ struct ContentView: View {
                             handleRemoteClick(file)
                         }
                     )
+                    .contextMenu {
+                        Button("열기") {
+                            viewModel.selectedRemoteFileIDs = [file.id]
+                            viewModel.openRemoteFolder(file)
+                        }
+                        .disabled(!file.isDirectory)
+
+                        Divider()
+                        Button("새 폴더") {
+                            viewModel.createRemoteFolder()
+                        }
+                        Button("이름 변경…") {
+                            viewModel.selectedRemoteFileIDs = [file.id]
+                            viewModel.renameSelectedRemoteFile()
+                        }
+
+                        Divider()
+                        Button("삭제", role: .destructive) {
+                            if !viewModel.selectedRemoteFileIDs.contains(file.id) {
+                                viewModel.selectedRemoteFileIDs = [file.id]
+                            }
+                            viewModel.deleteSelectedRemoteFiles()
+                        }
+                    }
                 }
                 .width(min: 100, ideal: 390, max: .infinity)
             }
@@ -339,10 +370,15 @@ struct ContentView: View {
                 return receiveFilesForUpload(from: providers)
             }
             .onKeyPress(.return) {
-                if viewModel.selectedRemoteFiles.count == 1,
-                   let file = viewModel.selectedRemoteFile {
-                    viewModel.openRemoteFolder(file)
-                }
+                guard viewModel.selectedRemoteFiles.count == 1,
+                      !viewModel.isWorking else { return .ignored }
+                viewModel.renameSelectedRemoteFile()
+                return .handled
+            }
+            .onKeyPress(.delete) {
+                guard !viewModel.selectedRemoteFiles.isEmpty,
+                      !viewModel.isWorking else { return .ignored }
+                viewModel.deleteSelectedRemoteFiles()
                 return .handled
             }
 

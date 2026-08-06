@@ -41,6 +41,18 @@ int ad_mtp_download(ADMTPConnection *connection,
                     const char *destination_path,
                     ADMTPProgressCallback progress_callback, void *progress_context,
                     char **error_message);
+int ad_mtp_create_folder(ADMTPConnection *connection,
+                         const char *remote_directory, const char *name,
+                         uint32_t *object_id, char **error_message);
+int ad_mtp_create_folder_in_folder(ADMTPConnection *connection,
+                                   uint32_t storage_id, uint32_t folder_id,
+                                   const char *name, uint32_t *object_id,
+                                   char **error_message);
+int ad_mtp_rename_object(ADMTPConnection *connection,
+                         uint32_t object_id, const char *name,
+                         char **error_message);
+int ad_mtp_delete_object(ADMTPConnection *connection,
+                         uint32_t object_id, char **error_message);
 
 void ad_mtp_free_items(ADMTPItem *items, size_t count);
 void ad_mtp_free_string(char *value);

@@ -20,6 +20,14 @@ protocol MTPServicing: Sendable {
         destination: URL,
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws
+    func createFolder(
+        name: String,
+        remoteDirectory: String,
+        storageID: UInt32?,
+        folderID: UInt32?
+    ) async throws
+    func rename(file: RemoteFile, to name: String) async throws
+    func delete(file: RemoteFile) async throws
 }
 
 private final class MTPProgressReporter: @unchecked Sendable {
@@ -213,6 +221,58 @@ actor MTPService: MTPServicing {
                 &errorMessage
             )
         }
+        defer { ad_mtp_free_string(errorMessage) }
+        guard result == 0 else { throw MTPError(message(from: errorMessage)) }
+    }
+
+    func createFolder(
+        name: String,
+        remoteDirectory: String,
+        storageID: UInt32?,
+        folderID: UInt32?
+    ) async throws {
+        let connection = try activeConnection()
+        var objectID: UInt32 = 0
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        let result = name.withCString { namePointer in
+            if let storageID, let folderID {
+                return ad_mtp_create_folder_in_folder(
+                    connection,
+                    storageID,
+                    folderID,
+                    namePointer,
+                    &objectID,
+                    &errorMessage
+                )
+            }
+            return remoteDirectory.withCString { directoryPointer in
+                ad_mtp_create_folder(
+                    connection,
+                    directoryPointer,
+                    namePointer,
+                    &objectID,
+                    &errorMessage
+                )
+            }
+        }
+        defer { ad_mtp_free_string(errorMessage) }
+        guard result == 0 else { throw MTPError(message(from: errorMessage)) }
+    }
+
+    func rename(file: RemoteFile, to name: String) async throws {
+        let connection = try activeConnection()
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        let result = name.withCString {
+            ad_mtp_rename_object(connection, file.objectID, $0, &errorMessage)
+        }
+        defer { ad_mtp_free_string(errorMessage) }
+        guard result == 0 else { throw MTPError(message(from: errorMessage)) }
+    }
+
+    func delete(file: RemoteFile) async throws {
+        let connection = try activeConnection()
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        let result = ad_mtp_delete_object(connection, file.objectID, &errorMessage)
         defer { ad_mtp_free_string(errorMessage) }
         guard result == 0 else { throw MTPError(message(from: errorMessage)) }
     }

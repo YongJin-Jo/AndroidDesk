@@ -863,6 +863,137 @@ static int ad_mtp_safe_name(const char *name) {
            strchr(name, '/') == NULL;
 }
 
+static int ad_mtp_create_folder_at_location(
+    ADMTPConnection *connection,
+    LIBMTP_mtpdevice_t *device,
+    uint32_t storage_id,
+    uint32_t parent_id,
+    const char *name,
+    uint32_t *object_id,
+    char **error_message
+) {
+    if (!ad_mtp_safe_name(name)) {
+        ad_mtp_set_error(error_message,
+                         "폴더 이름은 비어 있을 수 없으며 '/'를 포함할 수 없습니다.");
+        return -1;
+    }
+
+    uint32_t existing_folder_id = 0;
+    if (ad_mtp_find_child_folder(device, storage_id, parent_id, name,
+                                 &existing_folder_id)) {
+        ad_mtp_set_error(error_message, "같은 이름의 폴더가 이미 있습니다.");
+        return -1;
+    }
+
+    char *mutable_name = strdup(name);
+    if (mutable_name == NULL) {
+        ad_mtp_set_error(error_message, "폴더 이름 처리 중 메모리가 부족합니다.");
+        return -1;
+    }
+    LIBMTP_Clear_Errorstack(device);
+    uint32_t folder_id = LIBMTP_Create_Folder(
+        device, mutable_name, parent_id, storage_id
+    );
+    free(mutable_name);
+    if (folder_id == 0) {
+        ad_mtp_set_device_error(device, error_message,
+                                "Android에 MTP 폴더를 만들지 못했습니다.");
+        return -1;
+    }
+
+    if (object_id != NULL) {
+        *object_id = folder_id;
+    }
+    ad_mtp_clear_index(connection);
+    return 0;
+}
+
+int ad_mtp_create_folder(ADMTPConnection *connection,
+                         const char *remote_directory, const char *name,
+                         uint32_t *object_id, char **error_message) {
+    if (error_message != NULL) *error_message = NULL;
+    if (object_id != NULL) *object_id = 0;
+    LIBMTP_mtpdevice_t *device = ad_mtp_connection_device(connection, error_message);
+    if (device == NULL) {
+        return -1;
+    }
+
+    ADMTPFolderLocation location;
+    if (ad_mtp_resolve_folder(device, remote_directory, &location,
+                              error_message) != 0) {
+        return -1;
+    }
+    return ad_mtp_create_folder_at_location(
+        connection, device, location.storage_id, location.folder_id,
+        name, object_id, error_message
+    );
+}
+
+int ad_mtp_create_folder_in_folder(ADMTPConnection *connection,
+                                   uint32_t storage_id, uint32_t folder_id,
+                                   const char *name, uint32_t *object_id,
+                                   char **error_message) {
+    if (error_message != NULL) *error_message = NULL;
+    if (object_id != NULL) *object_id = 0;
+    LIBMTP_mtpdevice_t *device = ad_mtp_connection_device(connection, error_message);
+    if (device == NULL) {
+        return -1;
+    }
+    return ad_mtp_create_folder_at_location(
+        connection, device, storage_id, folder_id,
+        name, object_id, error_message
+    );
+}
+
+int ad_mtp_rename_object(ADMTPConnection *connection,
+                         uint32_t object_id, const char *name,
+                         char **error_message) {
+    if (error_message != NULL) *error_message = NULL;
+    LIBMTP_mtpdevice_t *device = ad_mtp_connection_device(connection, error_message);
+    if (device == NULL) {
+        return -1;
+    }
+    if (!ad_mtp_safe_name(name)) {
+        ad_mtp_set_error(error_message,
+                         "이름은 비어 있을 수 없으며 '/'를 포함할 수 없습니다.");
+        return -1;
+    }
+
+    char *mutable_name = strdup(name);
+    if (mutable_name == NULL) {
+        ad_mtp_set_error(error_message, "이름 처리 중 메모리가 부족합니다.");
+        return -1;
+    }
+    LIBMTP_Clear_Errorstack(device);
+    int result = LIBMTP_Set_Object_Filename(device, object_id, mutable_name);
+    free(mutable_name);
+    if (result != 0) {
+        ad_mtp_set_device_error(device, error_message,
+                                "Android 항목의 이름을 변경하지 못했습니다.");
+        return -1;
+    }
+    ad_mtp_clear_index(connection);
+    return 0;
+}
+
+int ad_mtp_delete_object(ADMTPConnection *connection,
+                         uint32_t object_id, char **error_message) {
+    if (error_message != NULL) *error_message = NULL;
+    LIBMTP_mtpdevice_t *device = ad_mtp_connection_device(connection, error_message);
+    if (device == NULL) {
+        return -1;
+    }
+
+    LIBMTP_Clear_Errorstack(device);
+    if (LIBMTP_Delete_Object(device, object_id) != 0) {
+        ad_mtp_set_device_error(device, error_message,
+                                "Android 항목을 삭제하지 못했습니다.");
+        return -1;
+    }
+    ad_mtp_clear_index(connection);
+    return 0;
+}
+
 static int ad_mtp_download_folder(LIBMTP_mtpdevice_t *device,
                                   uint32_t storage_id,
                                   uint32_t folder_id,

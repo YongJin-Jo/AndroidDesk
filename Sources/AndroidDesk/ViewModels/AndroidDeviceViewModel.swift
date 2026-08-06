@@ -318,6 +318,91 @@ final class AndroidDeviceViewModel {
     var selectedLocalFile: LocalFile? { selectedLocalFiles.first }
     var selectedRemoteFile: RemoteFile? { selectedRemoteFiles.first }
 
+    func createRemoteFolder() {
+        guard isConnected, !isWorking else { return }
+        guard let name = requestRemoteName(
+            title: "새 폴더",
+            message: "Android의 현재 위치에 생성할 폴더 이름을 입력하세요.",
+            initialValue: "새 폴더"
+        ) else { return }
+        guard !remoteFiles.contains(where: { $0.name == name }) else {
+            showError(MTPError("\(name)과(와) 같은 이름의 항목이 이미 있습니다."))
+            return
+        }
+
+        let directory = remoteDirectory
+        let storageID = remoteStorageID
+        let folderID = remoteFolderID
+        let service = service
+        perform(status: "Android에 \(name) 폴더를 만드는 중…") {
+            try await service.createFolder(
+                name: name,
+                remoteDirectory: directory,
+                storageID: storageID,
+                folderID: folderID
+            )
+        } onSuccess: { [weak self] _ in
+            self?.markRemoteIndexStale()
+            self?.statusMessage = "\(name) 폴더를 만들었습니다."
+            self?.scheduleRemoteReload()
+        }
+    }
+
+    func renameSelectedRemoteFile() {
+        guard isConnected, !isWorking,
+              selectedRemoteFiles.count == 1,
+              let file = selectedRemoteFile else { return }
+        guard let name = requestRemoteName(
+            title: "이름 변경",
+            message: "Android 항목의 새 이름을 입력하세요.",
+            initialValue: file.name
+        ), name != file.name else { return }
+        guard !remoteFiles.contains(where: {
+            $0.objectID != file.objectID && $0.name == name
+        }) else {
+            showError(MTPError("\(name)과(와) 같은 이름의 항목이 이미 있습니다."))
+            return
+        }
+
+        let service = service
+        perform(status: "\(file.name)의 이름을 변경하는 중…") {
+            try await service.rename(file: file, to: name)
+        } onSuccess: { [weak self] _ in
+            self?.markRemoteIndexStale()
+            self?.statusMessage = "\(file.name)의 이름을 \(name)(으)로 변경했습니다."
+            self?.scheduleRemoteReload()
+        }
+    }
+
+    func deleteSelectedRemoteFiles() {
+        let files = selectedRemoteFiles
+        guard isConnected, !isWorking, !files.isEmpty else { return }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = files.count == 1
+            ? "\(files[0].name)을(를) 삭제하시겠습니까?"
+            : "선택한 \(files.count)개 항목을 삭제하시겠습니까?"
+        alert.informativeText = "Android에서 즉시 삭제되며 이 작업은 되돌릴 수 없습니다."
+        let deleteButton = alert.addButton(withTitle: "삭제")
+        deleteButton.hasDestructiveAction = true
+        alert.addButton(withTitle: "취소")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let service = service
+        perform(status: "Android 항목 \(files.count)개를 삭제하는 중…") {
+            for file in files {
+                try await service.delete(file: file)
+            }
+            return files.count
+        } onFinish: { [weak self] in
+            self?.markRemoteIndexStale()
+            self?.scheduleRemoteReload()
+        } onSuccess: { [weak self] count in
+            self?.statusMessage = "Android 항목 \(count)개를 삭제했습니다."
+        }
+    }
+
     func upload(urls: [URL]) {
         guard !urls.isEmpty else { return }
         guard !isWorking else { return }
@@ -425,6 +510,35 @@ final class AndroidDeviceViewModel {
             loadLocalFiles()
             statusMessage = "\(name)을(를) Mac 폴더로 복사했습니다."
         }
+    }
+
+    private func requestRemoteName(
+        title: String,
+        message: String,
+        initialValue: String
+    ) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "확인")
+        alert.addButton(withTitle: "취소")
+
+        let nameField = NSTextField(string: initialValue)
+        nameField.frame = NSRect(x: 0, y: 0, width: 320, height: 24)
+        alert.accessoryView = nameField
+        alert.window.initialFirstResponder = nameField
+        nameField.selectText(nil)
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty,
+              name != ".",
+              name != "..",
+              !name.contains("/") else {
+            showError(MTPError("이름은 비어 있을 수 없으며 '/'를 포함할 수 없습니다."))
+            return nil
+        }
+        return name
     }
 
     private func selectDownloadDestination(for file: RemoteFile) -> URL? {
