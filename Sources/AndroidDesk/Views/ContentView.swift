@@ -44,6 +44,11 @@ private final class DroppedURLCollector: @unchecked Sendable {
 }
 
 struct ContentView: View {
+    private enum NativeDragSource: Equatable {
+        case local
+        case remote
+    }
+
     private enum ClickTarget: Equatable {
         case local(LocalFile.ID)
         case remote(RemoteFile.ID)
@@ -56,6 +61,7 @@ struct ContentView: View {
     @State private var remotePathInput = "/"
     @State private var lastClickTarget: ClickTarget?
     @State private var lastClickDate: Date?
+    @State private var nativeDragSource: NativeDragSource?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -180,12 +186,20 @@ struct ContentView: View {
             }
             .tableColumnHeaders(.hidden)
             .background {
-                NativeFileTableBridge { indexes in
-                    indexes.compactMap { index in
-                        guard viewModel.filteredLocalFiles.indices.contains(index) else { return nil }
-                        return viewModel.filteredLocalFiles[index].url as NSURL as any NSPasteboardWriting
+                NativeFileTableBridge(
+                    dragWriters: { indexes in
+                        indexes.compactMap { index in
+                            guard viewModel.filteredLocalFiles.indices.contains(index) else { return nil }
+                            return viewModel.filteredLocalFiles[index].url as NSURL as any NSPasteboardWriting
+                        }
+                    },
+                    onDragBegan: {
+                        nativeDragSource = .local
+                    },
+                    onDragEnded: {
+                        nativeDragSource = nil
                     }
-                }
+                )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .overlay {
@@ -198,7 +212,8 @@ struct ContentView: View {
                 }
             }
             .onDrop(of: [.fileURL, .data, .folder], isTargeted: $isDropTargeted) { providers in
-                receiveFilesOnMac(from: providers)
+                guard nativeDragSource != .local else { return false }
+                return receiveFilesOnMac(from: providers)
             }
             .onKeyPress(.return) {
                 if viewModel.selectedLocalFiles.count == 1,
@@ -283,14 +298,22 @@ struct ContentView: View {
             }
             .tableColumnHeaders(.hidden)
             .background {
-                NativeFileTableBridge { indexes in
-                    indexes.compactMap { index in
-                        guard viewModel.filteredRemoteFiles.indices.contains(index) else { return nil }
-                        return viewModel.filePromiseProvider(
-                            for: viewModel.filteredRemoteFiles[index]
-                        ) as any NSPasteboardWriting
+                NativeFileTableBridge(
+                    dragWriters: { indexes in
+                        indexes.compactMap { index in
+                            guard viewModel.filteredRemoteFiles.indices.contains(index) else { return nil }
+                            return viewModel.filePromiseProvider(
+                                for: viewModel.filteredRemoteFiles[index]
+                            ) as any NSPasteboardWriting
+                        }
+                    },
+                    onDragBegan: {
+                        nativeDragSource = .remote
+                    },
+                    onDragEnded: {
+                        nativeDragSource = nil
                     }
-                }
+                )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .overlay {
@@ -312,7 +335,8 @@ struct ContentView: View {
                 }
             }
             .onDrop(of: [.fileURL], isTargeted: $isRemoteDropTargeted) { providers in
-                receiveFilesForUpload(from: providers)
+                guard nativeDragSource != .remote else { return false }
+                return receiveFilesForUpload(from: providers)
             }
             .onKeyPress(.return) {
                 if viewModel.selectedRemoteFiles.count == 1,
@@ -454,10 +478,11 @@ struct ContentView: View {
                 .first { provider.hasItemConformingToTypeIdentifier($0) }
             guard let typeIdentifier else { continue }
             acceptedProvider = true
+            let suggestedName = provider.suggestedName ?? "파일"
             provider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { url, error in
                 guard let url else {
                     report(
-                        provider.suggestedName ?? "파일",
+                        suggestedName,
                         error ?? MTPError("Android 파일을 다운로드할 수 없습니다.")
                     )
                     return

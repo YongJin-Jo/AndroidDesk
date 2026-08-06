@@ -12,9 +12,15 @@ private final class TableEventBox: @unchecked Sendable {
 
 struct NativeFileTableBridge: NSViewRepresentable {
     let dragWriters: (IndexSet) -> [any NSPasteboardWriting]
+    let onDragBegan: () -> Void
+    let onDragEnded: () -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(dragWriters: dragWriters)
+        Coordinator(
+            dragWriters: dragWriters,
+            onDragBegan: onDragBegan,
+            onDragEnded: onDragEnded
+        )
     }
 
     func makeNSView(context: Context) -> PassthroughView {
@@ -25,6 +31,8 @@ struct NativeFileTableBridge: NSViewRepresentable {
 
     func updateNSView(_ nsView: PassthroughView, context: Context) {
         context.coordinator.dragWriters = dragWriters
+        context.coordinator.onDragBegan = onDragBegan
+        context.coordinator.onDragEnded = onDragEnded
     }
 
     static func dismantleNSView(_ nsView: PassthroughView, coordinator: Coordinator) {
@@ -34,14 +42,22 @@ struct NativeFileTableBridge: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, NSDraggingSource {
         var dragWriters: (IndexSet) -> [any NSPasteboardWriting]
+        var onDragBegan: () -> Void
+        var onDragEnded: () -> Void
         private weak var observedView: NSView?
         private var eventMonitor: Any?
         private var selectionAnchor: Int?
         private var mouseDownRow: Int?
         private var didStartDragging = false
 
-        init(dragWriters: @escaping (IndexSet) -> [any NSPasteboardWriting]) {
+        init(
+            dragWriters: @escaping (IndexSet) -> [any NSPasteboardWriting],
+            onDragBegan: @escaping () -> Void,
+            onDragEnded: @escaping () -> Void
+        ) {
             self.dragWriters = dragWriters
+            self.onDragBegan = onDragBegan
+            self.onDragEnded = onDragEnded
         }
 
         func startObserving(in view: NSView) {
@@ -68,6 +84,14 @@ struct NativeFileTableBridge: NSViewRepresentable {
             sourceOperationMaskFor context: NSDraggingContext
         ) -> NSDragOperation {
             .copy
+        }
+
+        func draggingSession(
+            _ session: NSDraggingSession,
+            endedAt screenPoint: NSPoint,
+            operation: NSDragOperation
+        ) {
+            onDragEnded()
         }
 
         private func handle(_ eventBox: TableEventBox) {
@@ -109,6 +133,7 @@ struct NativeFileTableBridge: NSViewRepresentable {
                     )
                     return item
                 }
+                onDragBegan()
                 let session = tableView.beginDraggingSession(
                     with: draggingItems,
                     event: event,
