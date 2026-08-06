@@ -96,17 +96,26 @@ struct NativeFileTableBridge: NSViewRepresentable {
                 guard !writers.isEmpty else { return }
 
                 let rowIndexes = Array(tableView.selectedRowIndexes)
-                let draggingItems = zip(writers, rowIndexes).map { writer, rowIndex in
+                guard let preview = dragPreview(for: rowIndexes, in: tableView) else { return }
+                let leaderIndex = min(
+                    rowIndexes.firstIndex(of: mouseDownRow) ?? 0,
+                    writers.count - 1
+                )
+                let draggingItems = writers.enumerated().map { index, writer in
                     let item = NSDraggingItem(pasteboardWriter: writer)
-                    let frame = tableView.rect(ofRow: rowIndex)
-                    let image = NSImage(
-                        systemSymbolName: "doc.on.doc",
-                        accessibilityDescription: "파일 전송"
+                    item.setDraggingFrame(
+                        preview.frame,
+                        contents: index == leaderIndex ? preview.image : nil
                     )
-                    item.setDraggingFrame(frame, contents: image)
                     return item
                 }
-                tableView.beginDraggingSession(with: draggingItems, event: event, source: self)
+                let session = tableView.beginDraggingSession(
+                    with: draggingItems,
+                    event: event,
+                    source: self
+                )
+                session.draggingFormation = .none
+                session.draggingLeaderIndex = leaderIndex
                 didStartDragging = true
                 eventBox.shouldConsume = true
 
@@ -152,6 +161,54 @@ struct NativeFileTableBridge: NSViewRepresentable {
                 selectionAnchor = row
             }
             eventBox.shouldConsume = true
+        }
+
+        private func dragPreview(
+            for rowIndexes: [Int],
+            in tableView: NSTableView
+        ) -> (frame: NSRect, image: NSImage)? {
+            let rowImages = rowIndexes.compactMap { rowIndex in
+                tableView.rowView(atRow: rowIndex, makeIfNecessary: true).flatMap {
+                    snapshot(of: $0)
+                }
+            }
+            guard let firstRow = rowIndexes.first,
+                  !rowImages.isEmpty else { return nil }
+
+            let imageSize = NSSize(
+                width: rowImages.map(\.size.width).max() ?? 0,
+                height: rowImages.reduce(0) { $0 + $1.size.height }
+            )
+            let image = NSImage(size: imageSize)
+            image.lockFocus()
+            var y = imageSize.height
+            for rowImage in rowImages {
+                y -= rowImage.size.height
+                rowImage.draw(
+                    in: NSRect(
+                        x: 0,
+                        y: y,
+                        width: rowImage.size.width,
+                        height: rowImage.size.height
+                    )
+                )
+            }
+            image.unlockFocus()
+
+            var frame = tableView.rect(ofRow: firstRow)
+            frame.size = imageSize
+            return (frame, image)
+        }
+
+        private func snapshot(of view: NSView) -> NSImage? {
+            let bounds = view.bounds
+            guard !bounds.isEmpty,
+                  let representation = view.bitmapImageRepForCachingDisplay(in: bounds) else { return nil }
+
+            view.cacheDisplay(in: bounds, to: representation)
+            let image = NSImage(size: bounds.size)
+            image.addRepresentation(representation)
+            return image
         }
 
         private func tableView(at windowLocation: NSPoint) -> NSTableView? {
