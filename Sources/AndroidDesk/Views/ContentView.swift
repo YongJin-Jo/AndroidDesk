@@ -26,6 +26,23 @@ private enum LocalDropCopier {
     }
 }
 
+private final class DroppedURLCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var urls: [URL] = []
+
+    func append(_ url: URL) {
+        lock.lock()
+        urls.append(url)
+        lock.unlock()
+    }
+
+    var values: [URL] {
+        lock.lock()
+        defer { lock.unlock() }
+        return urls
+    }
+}
+
 struct ContentView: View {
     private enum ClickTarget: Equatable {
         case local(LocalFile.ID)
@@ -158,15 +175,17 @@ struct ContentView: View {
                             handleLocalClick(file)
                         }
                     )
-                    .onDrag {
-                        NSItemProvider(object: file.url as NSURL)
-                    }
                 }
                 .width(min: 100, ideal: 350, max: .infinity)
             }
             .tableColumnHeaders(.hidden)
             .background {
-                NativeTableSelectionBridge()
+                NativeFileTableBridge { indexes in
+                    indexes.compactMap { index in
+                        guard viewModel.filteredLocalFiles.indices.contains(index) else { return nil }
+                        return viewModel.filteredLocalFiles[index].url as NSURL as any NSPasteboardWriting
+                    }
+                }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .overlay {
@@ -259,15 +278,19 @@ struct ContentView: View {
                             handleRemoteClick(file)
                         }
                     )
-                    .onDrag {
-                        viewModel.dragProvider(for: file)
-                    }
                 }
                 .width(min: 100, ideal: 390, max: .infinity)
             }
             .tableColumnHeaders(.hidden)
             .background {
-                NativeTableSelectionBridge()
+                NativeFileTableBridge { indexes in
+                    indexes.compactMap { index in
+                        guard viewModel.filteredRemoteFiles.indices.contains(index) else { return nil }
+                        return viewModel.filePromiseProvider(
+                            for: viewModel.filteredRemoteFiles[index]
+                        ) as any NSPasteboardWriting
+                    }
+                }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .overlay {
@@ -375,14 +398,26 @@ struct ContentView: View {
     }
 
     private func receiveFilesForUpload(from providers: [NSItemProvider]) -> Bool {
-        for provider in providers {
+        let fileProviders = providers.filter {
+            $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+        }
+        guard !fileProviders.isEmpty else { return false }
+
+        let collector = DroppedURLCollector()
+        let group = DispatchGroup()
+        for provider in fileProviders {
+            group.enter()
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                defer { group.leave() }
                 guard let data = item as? Data,
                       let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                DispatchQueue.main.async { viewModel.upload(urls: [url]) }
+                collector.append(url)
             }
         }
-        return !providers.isEmpty
+        group.notify(queue: .main) {
+            viewModel.upload(urls: collector.values)
+        }
+        return true
     }
 
     private func receiveFilesOnMac(from providers: [NSItemProvider]) -> Bool {

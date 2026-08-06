@@ -3,15 +3,49 @@ import Foundation
 import Observation
 import UniformTypeIdentifiers
 
-private final class FileRepresentationCompletion: @unchecked Sendable {
-    private let completion: (URL?, Bool, Error?) -> Void
+private final class FilePromiseCompletion: @unchecked Sendable {
+    private let completion: (Error?) -> Void
 
-    init(_ completion: @escaping (URL?, Bool, Error?) -> Void) {
+    init(_ completion: @escaping (Error?) -> Void) {
         self.completion = completion
     }
 
-    func callAsFunction(_ url: URL?, _ isInPlace: Bool, _ error: Error?) {
-        completion(url, isInPlace, error)
+    func callAsFunction(_ error: Error?) {
+        completion(error)
+    }
+}
+
+private final class RemoteFilePromiseDelegate: NSObject, NSFilePromiseProviderDelegate, @unchecked Sendable {
+    private let fileName: String
+    private let writePromise: @Sendable (URL, FilePromiseCompletion) -> Void
+
+    init(
+        fileName: String,
+        writePromise: @escaping @Sendable (URL, FilePromiseCompletion) -> Void
+    ) {
+        self.fileName = fileName
+        self.writePromise = writePromise
+    }
+
+    @MainActor
+    func filePromiseProvider(
+        _ filePromiseProvider: NSFilePromiseProvider,
+        fileNameForType fileType: String
+    ) -> String {
+        fileName
+    }
+
+    nonisolated func filePromiseProvider(
+        _ filePromiseProvider: NSFilePromiseProvider,
+        writePromiseTo url: URL,
+        completionHandler: @escaping (Error?) -> Void
+    ) {
+        writePromise(url, FilePromiseCompletion(completionHandler))
+    }
+
+    @MainActor
+    func operationQueue(for filePromiseProvider: NSFilePromiseProvider) -> OperationQueue {
+        .main
     }
 }
 
@@ -65,6 +99,9 @@ final class AndroidDeviceViewModel {
     private var transferStartedAt: Date?
     private var currentTransferID: UUID?
     private var isAccessingLocalDirectory = false
+    private var activeFilePromises = 0
+    private var filePromiseTransferID: UUID?
+    private var failedFilePromises = 0
 
     init(service: any MTPServicing) {
         self.service = service
@@ -343,65 +380,41 @@ final class AndroidDeviceViewModel {
         }
     }
 
-    func dragProvider(for file: RemoteFile) -> NSItemProvider {
-        let provider = NSItemProvider()
-        provider.suggestedName = file.name
+    func filePromiseProvider(for file: RemoteFile) -> NSFilePromiseProvider {
         let fileExtension = URL(fileURLWithPath: file.name).pathExtension
         let contentType = file.isDirectory
             ? UTType.folder
             : UTType(filenameExtension: fileExtension) ?? UTType.data
-
-        provider.registerFileRepresentation(
-            forTypeIdentifier: contentType.identifier,
-            fileOptions: [],
-            visibility: .all
-        ) { [weak self] completion in
-            let progress = Progress(totalUnitCount: max(Int64(clamping: file.size), 1))
-            let completion = FileRepresentationCompletion(completion)
-
+        let promiseDelegate = RemoteFilePromiseDelegate(fileName: file.name) { [weak self] destination, completion in
             Task { @MainActor [weak self] in
                 guard let self else {
-                    completion(nil, false, CancellationError())
+                    completion(CancellationError())
                     return
                 }
-                guard !self.isWorking, self.isConnected else {
-                    completion(nil, false, MTPError("다른 전송 작업이 진행 중이거나 기기가 연결되어 있지 않습니다."))
+                guard self.isConnected,
+                      !self.isWorking || self.activeFilePromises > 0 else {
+                    completion(MTPError("다른 전송 작업이 진행 중이거나 기기가 연결되어 있지 않습니다."))
                     return
                 }
 
-                let temporaryDirectory = FileManager.default.temporaryDirectory
-                    .appendingPathComponent(UUID().uuidString, isDirectory: true)
-                let destination = temporaryDirectory
-                    .appendingPathComponent(file.name, isDirectory: file.isDirectory)
-                let transferID = self.beginTransferProgress()
-                self.isWorking = true
-                self.statusMessage = "\(file.name)을(를) Mac으로 전송하는 중…"
-
+                let transferID = self.beginFilePromiseTransfer()
                 do {
-                    try FileManager.default.createDirectory(
-                        at: temporaryDirectory,
-                        withIntermediateDirectories: true
-                    )
                     try await self.service.download(file: file, destination: destination) { [weak self] value in
-                        progress.totalUnitCount = max(Int64(clamping: value.totalBytes), 1)
-                        progress.completedUnitCount = Int64(clamping: value.bytesTransferred)
                         Task { @MainActor [weak self] in
                             self?.updateTransferProgress(value, for: transferID)
                         }
                     }
-                    self.isWorking = false
-                    self.finishTransferProgress(for: transferID)
-                    self.statusMessage = "\(file.name)을(를) Mac으로 전송했습니다."
-                    completion(destination, false, nil)
+                    self.finishFilePromiseTransfer(succeeded: true)
+                    completion(nil)
                 } catch {
-                    self.isWorking = false
-                    self.finishTransferProgress(for: transferID)
+                    self.finishFilePromiseTransfer(succeeded: false)
                     self.showError(error)
-                    completion(nil, false, error)
+                    completion(error)
                 }
             }
-            return progress
         }
+        let provider = NSFilePromiseProvider(fileType: contentType.identifier, delegate: promiseDelegate)
+        provider.userInfo = promiseDelegate
         return provider
     }
 
@@ -490,6 +503,37 @@ final class AndroidDeviceViewModel {
         transferRateBytesPerSecond = 0
         transferStartedAt = Date()
         return transferID
+    }
+
+    private func beginFilePromiseTransfer() -> UUID {
+        if activeFilePromises == 0 {
+            filePromiseTransferID = beginTransferProgress()
+            failedFilePromises = 0
+        }
+        activeFilePromises += 1
+        isWorking = true
+        statusMessage = "\(activeFilePromises)개 Android 항목을 Mac으로 전송하는 중…"
+        guard let filePromiseTransferID else {
+            preconditionFailure("파일 약속 전송 ID가 준비되지 않았습니다.")
+        }
+        return filePromiseTransferID
+    }
+
+    private func finishFilePromiseTransfer(succeeded: Bool) {
+        if !succeeded {
+            failedFilePromises += 1
+        }
+        activeFilePromises = max(activeFilePromises - 1, 0)
+        guard activeFilePromises == 0 else { return }
+
+        if let filePromiseTransferID {
+            finishTransferProgress(for: filePromiseTransferID)
+        }
+        self.filePromiseTransferID = nil
+        isWorking = false
+        statusMessage = failedFilePromises == 0
+            ? "선택한 Android 항목을 Mac으로 전송했습니다."
+            : "Android 항목 \(failedFilePromises)개를 전송하지 못했습니다."
     }
 
     private func updateTransferProgress(_ progress: TransferProgress, for transferID: UUID) {
