@@ -86,12 +86,10 @@ final class AndroidDeviceViewModel {
     var localFiles: [LocalFile] = []
     var selectedLocalFileIDs: Set<LocalFile.ID> = []
     var localSearchText = ""
-    var localSortOption: FileSortOption = .name
     var remoteDirectory = "/"
     var remoteFiles: [RemoteFile] = []
     var selectedRemoteFileIDs: Set<RemoteFile.ID> = []
     var remoteSearchText = ""
-    var remoteSortOption: FileSortOption = .name
     var statusMessage = "준비됨"
     var isWorking = false
     var isLoadingRemoteFiles = true
@@ -156,7 +154,12 @@ final class AndroidDeviceViewModel {
 
     func loadLocalFiles() {
         do {
-            let keys: Set<URLResourceKey> = [.isDirectoryKey, .fileSizeKey]
+            let keys: Set<URLResourceKey> = [
+                .isDirectoryKey,
+                .fileSizeKey,
+                .creationDateKey,
+                .localizedTypeDescriptionKey
+            ]
             let urls = try FileManager.default.contentsOfDirectory(
                 at: localDirectory,
                 includingPropertiesForKeys: Array(keys),
@@ -168,7 +171,9 @@ final class AndroidDeviceViewModel {
                 return LocalFile(
                     url: url,
                     isDirectory: isDirectory,
-                    size: UInt64(values.fileSize ?? 0)
+                    size: UInt64(values.fileSize ?? 0),
+                    addedDate: values.creationDate,
+                    kind: values.localizedTypeDescription ?? (isDirectory ? "폴더" : "파일")
                 )
             }
             selectedLocalFileIDs = Set(filteredLocalFiles.prefix(1).map(\.id))
@@ -420,15 +425,15 @@ final class AndroidDeviceViewModel {
     }
 
     var filteredLocalFiles: [LocalFile] {
-        sort(localFiles.filter { file in
+        localFiles.filter { file in
             localSearchText.isEmpty || file.name.localizedCaseInsensitiveContains(localSearchText)
-        }, by: localSortOption)
+        }
     }
 
     var filteredRemoteFiles: [RemoteFile] {
-        sort(remoteFiles.filter { file in
+        remoteFiles.filter { file in
             remoteSearchText.isEmpty || file.name.localizedCaseInsensitiveContains(remoteSearchText)
-        }, by: remoteSortOption)
+        }
     }
 
     var selectedLocalFiles: [LocalFile] {
@@ -464,7 +469,9 @@ final class AndroidDeviceViewModel {
             storageID: optimisticStorageID,
             name: name,
             isDirectory: true,
-            size: 0
+            size: 0,
+            addedDate: Date(),
+            kind: "폴더"
         )
         insertRemoteFile(optimisticFolder)
         selectedRemoteFileIDs = [optimisticFolder.id]
@@ -717,7 +724,9 @@ final class AndroidDeviceViewModel {
             storageID: file.storageID,
             name: name,
             isDirectory: file.isDirectory,
-            size: file.size
+            size: file.size,
+            addedDate: file.addedDate,
+            kind: file.kind
         )
         let replace: (RemoteFile) -> RemoteFile = { candidate in
             candidate.objectID == file.objectID && candidate.storageID == file.storageID
@@ -1300,33 +1309,4 @@ final class AndroidDeviceViewModel {
         isShowingError = true
     }
 
-    private func sort(_ files: [LocalFile], by option: FileSortOption) -> [LocalFile] {
-        files.sorted { lhs, rhs in
-            switch option {
-            case .name:
-                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-            case .kind:
-                if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
-                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-            case .size:
-                if lhs.size != rhs.size { return lhs.size > rhs.size }
-                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-            }
-        }
-    }
-
-    private func sort(_ files: [RemoteFile], by option: FileSortOption) -> [RemoteFile] {
-        files.sorted { lhs, rhs in
-            switch option {
-            case .name:
-                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-            case .kind:
-                if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
-                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-            case .size:
-                if lhs.size != rhs.size { return lhs.size > rhs.size }
-                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-            }
-        }
-    }
 }

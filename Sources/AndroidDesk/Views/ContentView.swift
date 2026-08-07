@@ -59,6 +59,11 @@ private struct RemoteTableRow: Identifiable {
         file = nil
         placeholderName = name
     }
+
+    var sortableName: String { file?.name ?? placeholderName }
+    var sortableSize: UInt64 { file?.size ?? 0 }
+    var sortableAddedDate: Date { file?.sortableAddedDate ?? .distantPast }
+    var sortableKind: String { file?.kind ?? "" }
 }
 
 struct ContentView: View {
@@ -82,6 +87,8 @@ struct ContentView: View {
     @State private var nativeDragSource: NativeDragSource?
     @State private var renamingLocalFileID: LocalFile.ID?
     @State private var renamingRemoteFileID: RemoteFile.ID?
+    @State private var localSortOrder = [KeyPathComparator(\LocalFile.name)]
+    @State private var remoteSortOrder = [KeyPathComparator(\RemoteTableRow.sortableName)]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -204,12 +211,18 @@ struct ContentView: View {
 
             fileControls(
                 searchText: $viewModel.localSearchText,
-                sortOption: $viewModel.localSortOption,
                 prompt: "Mac 파일 검색"
             )
 
-            Table(viewModel.filteredLocalFiles, selection: $viewModel.selectedLocalFileIDs) {
-                TableColumn("이름") { file in
+            Table(
+                displayedLocalFiles,
+                selection: $viewModel.selectedLocalFileIDs,
+                sortOrder: $localSortOrder
+            ) {
+                TableColumn(
+                    "이름",
+                    sortUsing: KeyPathComparator(\LocalFile.name)
+                ) { file in
                     HStack {
                         Image(systemName: file.isDirectory ? "folder" : "doc")
                             .foregroundStyle(file.isDirectory ? .orange : .secondary)
@@ -264,15 +277,42 @@ struct ContentView: View {
                         }
                     }
                 }
-                .width(min: 100, ideal: 350, max: .infinity)
+                .width(min: 160, ideal: 260, max: 420)
+                TableColumn(
+                    "크기",
+                    sortUsing: KeyPathComparator(\LocalFile.size)
+                ) { file in
+                    Text(fileSizeText(size: file.size, isDirectory: file.isDirectory))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+                .width(min: 72, ideal: 88, max: 110)
+                TableColumn(
+                    "추가된 날짜",
+                    sortUsing: KeyPathComparator(\LocalFile.sortableAddedDate)
+                ) { file in
+                    Text(fileDateText(file.addedDate))
+                        .foregroundStyle(.secondary)
+                }
+                .width(min: 125, ideal: 145, max: 180)
+                TableColumn(
+                    "종류",
+                    sortUsing: KeyPathComparator(\LocalFile.kind)
+                ) { file in
+                    Text(file.kind)
+                        .lineLimit(1)
+                        .foregroundStyle(.secondary)
+                }
+                .width(min: 90, ideal: 115, max: 160)
             }
-            .tableColumnHeaders(.hidden)
+            .tableColumnHeaders(.visible)
             .background {
                 NativeFileTableBridge(
                     dragWriters: { indexes in
                         indexes.compactMap { index in
-                            guard viewModel.filteredLocalFiles.indices.contains(index) else { return nil }
-                            return viewModel.filteredLocalFiles[index].url as NSURL as any NSPasteboardWriting
+                            guard displayedLocalFiles.indices.contains(index) else { return nil }
+                            return displayedLocalFiles[index].url as NSURL as any NSPasteboardWriting
                         }
                     },
                     onDragBegan: {
@@ -282,7 +322,7 @@ struct ContentView: View {
                         nativeDragSource = nil
                     },
                     editingRow: renamingLocalFileID.flatMap { fileID in
-                        viewModel.filteredLocalFiles.firstIndex { $0.id == fileID }
+                        displayedLocalFiles.firstIndex { $0.id == fileID }
                     },
                     onCreateFolder: {
                         viewModel.createLocalFolder()
@@ -379,28 +419,73 @@ struct ContentView: View {
 
             fileControls(
                 searchText: $viewModel.remoteSearchText,
-                sortOption: $viewModel.remoteSortOption,
                 prompt: "Android 파일 검색"
             )
 
-            Table(remoteTableRows, selection: remoteTableSelection) {
-                TableColumn("이름") { row in
+            Table(
+                remoteTableRows,
+                selection: remoteTableSelection,
+                sortOrder: $remoteSortOrder
+            ) {
+                TableColumn(
+                    "이름",
+                    sortUsing: KeyPathComparator(\RemoteTableRow.sortableName)
+                ) { row in
                     if let file = row.file {
                         remoteFileRow(file)
                     } else {
                         remoteSkeletonRow(name: row.placeholderName)
                     }
                 }
-                .width(min: 100, ideal: 390, max: .infinity)
+                .width(min: 160, ideal: 280, max: 440)
+                TableColumn(
+                    "크기",
+                    sortUsing: KeyPathComparator(\RemoteTableRow.sortableSize)
+                ) { row in
+                    if let file = row.file {
+                        Text(fileSizeText(size: file.size, isDirectory: file.isDirectory))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .trailing)
+                    } else {
+                        remoteSkeletonMetadata(width: 54)
+                    }
+                }
+                .width(min: 72, ideal: 88, max: 110)
+                TableColumn(
+                    "추가된 날짜",
+                    sortUsing: KeyPathComparator(\RemoteTableRow.sortableAddedDate)
+                ) { row in
+                    if let file = row.file {
+                        Text(fileDateText(file.addedDate))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        remoteSkeletonMetadata(width: 100)
+                    }
+                }
+                .width(min: 125, ideal: 145, max: 180)
+                TableColumn(
+                    "종류",
+                    sortUsing: KeyPathComparator(\RemoteTableRow.sortableKind)
+                ) { row in
+                    if let file = row.file {
+                        Text(file.kind)
+                            .lineLimit(1)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        remoteSkeletonMetadata(width: 68)
+                    }
+                }
+                .width(min: 90, ideal: 115, max: 160)
             }
-            .tableColumnHeaders(.hidden)
+            .tableColumnHeaders(.visible)
             .background {
                 NativeFileTableBridge(
                     dragWriters: { indexes in
                         indexes.compactMap { index in
-                            guard viewModel.filteredRemoteFiles.indices.contains(index) else { return nil }
+                            guard displayedRemoteFiles.indices.contains(index) else { return nil }
                             return viewModel.filePromiseProvider(
-                                for: viewModel.filteredRemoteFiles[index]
+                                for: displayedRemoteFiles[index]
                             ) as any NSPasteboardWriting
                         }
                     },
@@ -411,7 +496,7 @@ struct ContentView: View {
                         nativeDragSource = nil
                     },
                     editingRow: renamingRemoteFileID.flatMap { fileID in
-                        viewModel.filteredRemoteFiles.firstIndex { $0.id == fileID }
+                        displayedRemoteFiles.firstIndex { $0.id == fileID }
                     },
                     onCreateFolder: viewModel.isLoadingRemoteFiles || viewModel.isTransferQueueActive ? nil : {
                         viewModel.createRemoteFolder()
@@ -489,7 +574,17 @@ struct ContentView: View {
                 RemoteTableRow(placeholderIndex: $0.offset, name: $0.element)
             }
         }
-        return viewModel.filteredRemoteFiles.map(RemoteTableRow.init(file:))
+        return viewModel.filteredRemoteFiles
+            .map(RemoteTableRow.init(file:))
+            .sorted(using: remoteSortOrder)
+    }
+
+    private var displayedLocalFiles: [LocalFile] {
+        viewModel.filteredLocalFiles.sorted(using: localSortOrder)
+    }
+
+    private var displayedRemoteFiles: [RemoteFile] {
+        remoteTableRows.compactMap(\.file)
     }
 
     private var remoteTableSelection: Binding<Set<RemoteFile.ID>> {
@@ -572,6 +667,25 @@ struct ContentView: View {
         .accessibilityHidden(true)
     }
 
+    private func remoteSkeletonMetadata(width: CGFloat) -> some View {
+        NativeSkeletonPulseView(cornerRadius: 4)
+            .frame(width: width, height: 12)
+            .accessibilityHidden(true)
+    }
+
+    private func fileSizeText(size: UInt64, isDirectory: Bool) -> String {
+        guard !isDirectory else { return "—" }
+        return ByteCountFormatter.string(
+            fromByteCount: Int64(clamping: size),
+            countStyle: .file
+        )
+    }
+
+    private func fileDateText(_ date: Date?) -> String {
+        guard let date else { return "—" }
+        return date.formatted(date: .numeric, time: .shortened)
+    }
+
     private var statusBar: some View {
         HStack {
             if viewModel.isWorking {
@@ -592,20 +706,10 @@ struct ContentView: View {
 
     private func fileControls(
         searchText: Binding<String>,
-        sortOption: Binding<FileSortOption>,
         prompt: String
     ) -> some View {
-        HStack(spacing: 8) {
-            TextField(prompt, text: searchText)
-                .textFieldStyle(.roundedBorder)
-            Picker("정렬", selection: sortOption) {
-                ForEach(FileSortOption.allCases) { option in
-                    Text(option.rawValue).tag(option)
-                }
-            }
-            .labelsHidden()
-            .frame(width: 90)
-        }
+        TextField(prompt, text: searchText)
+            .textFieldStyle(.roundedBorder)
     }
 
     private func receiveFilesForUpload(from providers: [NSItemProvider]) -> Bool {

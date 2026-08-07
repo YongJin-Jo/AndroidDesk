@@ -1,20 +1,15 @@
 import Foundation
 
-enum FileSortOption: String, CaseIterable, Identifiable {
-    case name = "이름"
-    case kind = "종류"
-    case size = "크기"
-
-    var id: Self { self }
-}
-
 struct LocalFile: Identifiable, Hashable, Sendable {
     let url: URL
     let isDirectory: Bool
     let size: UInt64
+    let addedDate: Date?
+    let kind: String
 
     var id: URL { url }
     var name: String { url.lastPathComponent }
+    var sortableAddedDate: Date { addedDate ?? .distantPast }
 }
 
 struct RemoteFile: Identifiable, Hashable, Sendable {
@@ -23,8 +18,11 @@ struct RemoteFile: Identifiable, Hashable, Sendable {
     let name: String
     let isDirectory: Bool
     let size: UInt64
+    let addedDate: Date?
+    let kind: String
 
     var id: String { "\(storageID):\(objectID)" }
+    var sortableAddedDate: Date { addedDate ?? .distantPast }
 }
 
 struct MTPDeviceInfo: Sendable {

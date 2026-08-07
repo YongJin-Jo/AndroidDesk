@@ -26,8 +26,10 @@ typedef struct ADMTPIndexedItem {
     uint32_t parent_id;
     uint32_t storage_id;
     uint64_t size;
+    int64_t modification_time;
     int is_directory;
     char *name;
+    char *kind;
     struct ADMTPIndexedItem *next;
 } ADMTPIndexedItem;
 
@@ -95,6 +97,7 @@ static void ad_mtp_clear_index(ADMTPConnection *connection) {
     while (item != NULL) {
         ADMTPIndexedItem *next = item->next;
         free(item->name);
+        free(item->kind);
         free(item);
         item = next;
     }
@@ -368,9 +371,14 @@ static int ad_mtp_make_items_from_file_list(LIBMTP_file_t *files,
         result[index].object_id = current->item_id;
         result[index].storage_id = current->storage_id;
         result[index].size = current->filesize;
+        result[index].modification_time = (int64_t) current->modificationdate;
         result[index].is_directory = current->filetype == LIBMTP_FILETYPE_FOLDER;
         result[index].name = strdup(current->filename == NULL ? "이름 없음" : current->filename);
-        if (result[index].name == NULL) {
+        const char *kind = result[index].is_directory
+            ? "폴더"
+            : LIBMTP_Get_Filetype_Description(current->filetype);
+        result[index].kind = strdup(kind == NULL || kind[0] == '\0' ? "파일" : kind);
+        if (result[index].name == NULL || result[index].kind == NULL) {
             ad_mtp_free_items(result, item_count);
             ad_mtp_destroy_file_list(files);
             ad_mtp_set_error(error_message, "MTP 목록 처리 중 메모리가 부족합니다.");
@@ -421,9 +429,11 @@ static int ad_mtp_copy_index_items(ADMTPIndexedItem *indexed_items,
         result[index].object_id = current->object_id;
         result[index].storage_id = current->storage_id;
         result[index].size = current->size;
+        result[index].modification_time = current->modification_time;
         result[index].is_directory = current->is_directory;
         result[index].name = strdup(current->name);
-        if (result[index].name == NULL) {
+        result[index].kind = strdup(current->kind);
+        if (result[index].name == NULL || result[index].kind == NULL) {
             ad_mtp_free_items(result, item_count);
             ad_mtp_set_error(error_message, "MTP 인덱스 처리 중 메모리가 부족합니다.");
             return -1;
@@ -439,7 +449,8 @@ static int ad_mtp_copy_index_items(ADMTPIndexedItem *indexed_items,
 static int ad_mtp_add_index_item(ADMTPConnection *connection,
                                  uint32_t object_id, uint32_t parent_id,
                                  uint32_t storage_id, uint64_t size,
-                                 int is_directory, const char *name,
+                                 int64_t modification_time, int is_directory,
+                                 const char *name, const char *kind,
                                  char **error_message) {
     ADMTPIndexedItem *item = calloc(1, sizeof(ADMTPIndexedItem));
     if (item == NULL) {
@@ -447,7 +458,12 @@ static int ad_mtp_add_index_item(ADMTPConnection *connection,
         return -1;
     }
     item->name = strdup(name == NULL ? "이름 없음" : name);
-    if (item->name == NULL) {
+    item->kind = strdup(kind == NULL || kind[0] == '\0'
+        ? (is_directory ? "폴더" : "파일")
+        : kind);
+    if (item->name == NULL || item->kind == NULL) {
+        free(item->name);
+        free(item->kind);
         free(item);
         ad_mtp_set_error(error_message, "MTP 인덱스 처리 중 메모리가 부족합니다.");
         return -1;
@@ -456,10 +472,25 @@ static int ad_mtp_add_index_item(ADMTPConnection *connection,
     item->parent_id = parent_id;
     item->storage_id = storage_id;
     item->size = size;
+    item->modification_time = modification_time;
     item->is_directory = is_directory;
     item->next = connection->index;
     connection->index = item;
     return 0;
+}
+
+static void ad_mtp_update_indexed_folder_metadata(
+    ADMTPConnection *connection,
+    const LIBMTP_file_t *folder
+) {
+    for (ADMTPIndexedItem *item = connection->index;
+         item != NULL; item = item->next) {
+        if (item->object_id == folder->item_id &&
+            (folder->storage_id == 0 || item->storage_id == folder->storage_id)) {
+            item->modification_time = (int64_t) folder->modificationdate;
+            return;
+        }
+    }
 }
 
 static int ad_mtp_add_folder_tree_to_index(ADMTPConnection *connection,
@@ -474,7 +505,7 @@ static int ad_mtp_add_folder_tree_to_index(ADMTPConnection *connection,
             : folder->storage_id;
         if (ad_mtp_add_index_item(
                 connection, folder->folder_id, parent_id, folder_storage_id,
-                0, 1, folder->name, error_message
+                0, 0, 1, folder->name, "폴더", error_message
             ) != 0) {
             return -1;
         }
@@ -540,11 +571,14 @@ static int ad_mtp_load_index(ADMTPConnection *connection,
     int file_result = 0;
     for (LIBMTP_file_t *file = files; file != NULL; file = file->next) {
         if (file->filetype == LIBMTP_FILETYPE_FOLDER) {
+            ad_mtp_update_indexed_folder_metadata(connection, file);
             continue;
         }
         if (ad_mtp_add_index_item(
                 connection, file->item_id, file->parent_id, file->storage_id,
-                file->filesize, 0, file->filename, error_message
+                file->filesize, (int64_t) file->modificationdate, 0,
+                file->filename,
+                LIBMTP_Get_Filetype_Description(file->filetype), error_message
             ) != 0) {
             file_result = -1;
             break;
@@ -1107,6 +1141,7 @@ void ad_mtp_free_items(ADMTPItem *items, size_t count) {
     }
     for (size_t index = 0; index < count; index++) {
         free(items[index].name);
+        free(items[index].kind);
     }
     free(items);
 }

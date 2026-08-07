@@ -327,7 +327,12 @@ actor MTPService: MTPServicing {
                 storageID: item.storage_id,
                 name: item.name.map { String(cString: $0) } ?? "이름 없음",
                 isDirectory: item.is_directory != 0,
-                size: item.size
+                size: item.size,
+                addedDate: item.modification_time > 0
+                    ? Date(timeIntervalSince1970: TimeInterval(item.modification_time))
+                    : nil,
+                kind: item.kind.map { String(cString: $0) }
+                    ?? (item.is_directory != 0 ? "폴더" : "파일")
             )
         }
     }

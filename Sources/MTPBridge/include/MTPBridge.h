@@ -8,8 +8,10 @@ typedef struct {
     uint32_t object_id;
     uint32_t storage_id;
     uint64_t size;
+    int64_t modification_time;
     int is_directory;
     char *name;
+    char *kind;
 } ADMTPItem;
 
 typedef struct ADMTPConnection ADMTPConnection;
