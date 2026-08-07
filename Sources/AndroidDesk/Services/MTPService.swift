@@ -13,11 +13,13 @@ protocol MTPServicing: Sendable {
         remoteDirectory: String,
         storageID: UInt32?,
         folderID: UInt32?,
+        cancellation: TransferCancellationToken,
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws
     func download(
         file: RemoteFile,
         destination: URL,
+        cancellation: TransferCancellationToken,
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws
     func createFolder(
@@ -32,15 +34,21 @@ protocol MTPServicing: Sendable {
 
 private final class MTPProgressReporter: @unchecked Sendable {
     private let report: @Sendable (TransferProgress) -> Void
+    private let cancellation: TransferCancellationToken
     private let lock = NSLock()
     private var lastReportAt = Date.distantPast
     private var lastTransferredBytes: UInt64 = 0
 
-    init(report: @escaping @Sendable (TransferProgress) -> Void) {
+    init(
+        cancellation: TransferCancellationToken,
+        report: @escaping @Sendable (TransferProgress) -> Void
+    ) {
+        self.cancellation = cancellation
         self.report = report
     }
 
-    func receive(bytesTransferred: UInt64, totalBytes: UInt64) {
+    func receive(bytesTransferred: UInt64, totalBytes: UInt64) -> Bool {
+        guard !cancellation.isCancelled else { return false }
         let now = Date()
         lock.lock()
         let isNewFile = bytesTransferred < lastTransferredBytes
@@ -53,16 +61,17 @@ private final class MTPProgressReporter: @unchecked Sendable {
         lastTransferredBytes = bytesTransferred
         lock.unlock()
 
-        guard shouldReport else { return }
-        report(TransferProgress(bytesTransferred: bytesTransferred, totalBytes: totalBytes))
+        if shouldReport, totalBytes > 0 {
+            report(TransferProgress(bytesTransferred: bytesTransferred, totalBytes: totalBytes))
+        }
+        return !cancellation.isCancelled
     }
 }
 
 private let mtpProgressCallback: ADMTPProgressCallback = { bytesTransferred, totalBytes, context in
     guard let context else { return 0 }
     let reporter = Unmanaged<MTPProgressReporter>.fromOpaque(context).takeUnretainedValue()
-    reporter.receive(bytesTransferred: bytesTransferred, totalBytes: totalBytes)
-    return 0
+    return reporter.receive(bytesTransferred: bytesTransferred, totalBytes: totalBytes) ? 0 : 1
 }
 
 actor MTPService: MTPServicing {
@@ -167,11 +176,12 @@ actor MTPService: MTPServicing {
         remoteDirectory: String,
         storageID: UInt32?,
         folderID: UInt32?,
+        cancellation: TransferCancellationToken,
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws {
         let connection = try activeConnection()
         var errorMessage: UnsafeMutablePointer<CChar>?
-        let reporter = MTPProgressReporter(report: progress)
+        let reporter = MTPProgressReporter(cancellation: cancellation, report: progress)
         let progressContext = Unmanaged.passUnretained(reporter).toOpaque()
         let result = localURL.path.withCString { localPath in
             if let storageID, let folderID {
@@ -197,17 +207,19 @@ actor MTPService: MTPServicing {
             }
         }
         defer { ad_mtp_free_string(errorMessage) }
+        if cancellation.isCancelled { throw CancellationError() }
         guard result == 0 else { throw MTPError(message(from: errorMessage)) }
     }
 
     func download(
         file: RemoteFile,
         destination: URL,
+        cancellation: TransferCancellationToken,
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws {
         let connection = try activeConnection()
         var errorMessage: UnsafeMutablePointer<CChar>?
-        let reporter = MTPProgressReporter(report: progress)
+        let reporter = MTPProgressReporter(cancellation: cancellation, report: progress)
         let progressContext = Unmanaged.passUnretained(reporter).toOpaque()
         let result = destination.path.withCString {
             ad_mtp_download(
@@ -222,6 +234,7 @@ actor MTPService: MTPServicing {
             )
         }
         defer { ad_mtp_free_string(errorMessage) }
+        if cancellation.isCancelled { throw CancellationError() }
         guard result == 0 else { throw MTPError(message(from: errorMessage)) }
     }
 

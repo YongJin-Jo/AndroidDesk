@@ -121,6 +121,16 @@ static int ad_mtp_report_progress(uint64_t sent, uint64_t total,
     return progress->callback(sent, total, progress->context);
 }
 
+static int ad_mtp_transfer_cancelled(const ADMTPProgressContext *progress,
+                                     char **error_message) {
+    if (progress == NULL || progress->callback == NULL ||
+        progress->callback(0, 0, progress->context) == 0) {
+        return 0;
+    }
+    ad_mtp_set_error(error_message, "전송이 취소되었습니다.");
+    return 1;
+}
+
 /*
  * libmtp documents 0xffffffff as the root parent identifier. Some Android
  * devices reject that value with PTP error 0x02ff and accept 0 instead.
@@ -714,6 +724,9 @@ static int ad_mtp_send_path(LIBMTP_mtpdevice_t *device,
                             uint32_t parent_id,
                             const ADMTPProgressContext *progress,
                             char **error_message) {
+    if (ad_mtp_transfer_cancelled(progress, error_message)) {
+        return -1;
+    }
     struct stat info;
     if (stat(local_path, &info) != 0) {
         ad_mtp_set_error(error_message, strerror(errno));
@@ -752,6 +765,10 @@ static int ad_mtp_send_path(LIBMTP_mtpdevice_t *device,
         struct dirent *entry;
         int result = 0;
         while ((entry = readdir(directory)) != NULL) {
+            if (ad_mtp_transfer_cancelled(progress, error_message)) {
+                result = -1;
+                break;
+            }
             if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
                 continue;
             }
@@ -828,9 +845,7 @@ int ad_mtp_upload(ADMTPConnection *connection,
     };
     int result = ad_mtp_send_path(device, local_path, location.storage_id,
                                   location.folder_id, &progress, error_message);
-    if (result == 0) {
-        ad_mtp_clear_index(connection);
-    }
+    ad_mtp_clear_index(connection);
     return result;
 }
 
@@ -851,9 +866,7 @@ int ad_mtp_upload_to_folder(ADMTPConnection *connection,
     };
     int result = ad_mtp_send_path(device, local_path, storage_id, folder_id,
                                   &progress, error_message);
-    if (result == 0) {
-        ad_mtp_clear_index(connection);
-    }
+    ad_mtp_clear_index(connection);
     return result;
 }
 
@@ -1000,6 +1013,9 @@ static int ad_mtp_download_folder(LIBMTP_mtpdevice_t *device,
                                   const char *destination_path,
                                   const ADMTPProgressContext *progress,
                                   char **error_message) {
+    if (ad_mtp_transfer_cancelled(progress, error_message)) {
+        return -1;
+    }
     if (mkdir(destination_path, 0755) != 0 && errno != EEXIST) {
         ad_mtp_set_error(error_message, strerror(errno));
         return -1;
@@ -1016,6 +1032,10 @@ static int ad_mtp_download_folder(LIBMTP_mtpdevice_t *device,
 
     int result = 0;
     for (LIBMTP_file_t *current = files; current != NULL; current = current->next) {
+        if (ad_mtp_transfer_cancelled(progress, error_message)) {
+            result = -1;
+            break;
+        }
         if (!ad_mtp_safe_name(current->filename)) {
             ad_mtp_set_error(error_message, "안전하지 않은 MTP 파일 이름을 발견했습니다.");
             result = -1;

@@ -95,6 +95,24 @@ struct ContentView: View {
                     .frame(minWidth: 390)
             }
 
+            if !viewModel.transferJobs.isEmpty {
+                Divider()
+                NativeTransferQueueView(
+                    jobs: viewModel.transferJobs,
+                    progressForJob: { viewModel.progressForTransfer(id: $0) },
+                    onCancel: { viewModel.cancelTransfer(id: $0) },
+                    onRetry: { viewModel.retryTransfer(id: $0) },
+                    onCancelAll: { viewModel.cancelAllTransfers() },
+                    onRetryFailed: { viewModel.retryFailedTransfers() },
+                    onClearFinished: { viewModel.clearFinishedTransfers() }
+                )
+                .frame(
+                    minHeight: 100,
+                    idealHeight: min(CGFloat(viewModel.transferJobs.count) * 53 + 48, 220),
+                    maxHeight: 220
+                )
+            }
+
             Divider()
             statusBar
         }
@@ -147,7 +165,7 @@ struct ContentView: View {
             } label: {
                 Label("새로고침", systemImage: "arrow.clockwise")
             }
-            .disabled(viewModel.isWorking)
+            .disabled(viewModel.isWorking || viewModel.isTransferQueueActive)
         }
         .padding()
     }
@@ -332,9 +350,17 @@ struct ContentView: View {
                 } label: {
                     Label("새 폴더", systemImage: "folder.badge.plus")
                 }
-                .disabled(!viewModel.isConnected || viewModel.isWorking)
+                .disabled(
+                    !viewModel.isConnected
+                        || viewModel.isWorking
+                        || viewModel.isTransferQueueActive
+                )
                 Button("목록 갱신") { viewModel.loadRemoteFiles(forceRefresh: true) }
-                    .disabled(!viewModel.isConnected || viewModel.isWorking)
+                    .disabled(
+                        !viewModel.isConnected
+                            || viewModel.isWorking
+                            || viewModel.isTransferQueueActive
+                    )
             }
 
             HStack(spacing: 8) {
@@ -387,7 +413,7 @@ struct ContentView: View {
                     editingRow: renamingRemoteFileID.flatMap { fileID in
                         viewModel.filteredRemoteFiles.firstIndex { $0.id == fileID }
                     },
-                    onCreateFolder: viewModel.isLoadingRemoteFiles ? nil : {
+                    onCreateFolder: viewModel.isLoadingRemoteFiles || viewModel.isTransferQueueActive ? nil : {
                         viewModel.createRemoteFolder()
                     }
                 )
@@ -421,14 +447,16 @@ struct ContentView: View {
                 guard renamingRemoteFileID == nil,
                       viewModel.selectedRemoteFiles.count == 1,
                       let file = viewModel.selectedRemoteFile,
-                      !viewModel.isWorking else { return .ignored }
+                      !viewModel.isWorking,
+                      !viewModel.isTransferQueueActive else { return .ignored }
                 beginRemoteRename(file)
                 return .handled
             }
             .onKeyPress(.delete) {
                 guard renamingRemoteFileID == nil,
                       !viewModel.selectedRemoteFiles.isEmpty,
-                      !viewModel.isWorking else { return .ignored }
+                      !viewModel.isWorking,
+                      !viewModel.isTransferQueueActive else { return .ignored }
                 viewModel.deleteSelectedRemoteFiles()
                 return .handled
             }
@@ -514,6 +542,7 @@ struct ContentView: View {
             Button("이름 변경…") {
                 beginRemoteRename(file)
             }
+            .disabled(viewModel.isTransferQueueActive)
 
             Divider()
             Button("삭제", role: .destructive) {
@@ -523,6 +552,7 @@ struct ContentView: View {
                 }
                 viewModel.deleteSelectedRemoteFiles()
             }
+            .disabled(viewModel.isTransferQueueActive)
         }
     }
 
@@ -545,13 +575,8 @@ struct ContentView: View {
     private var statusBar: some View {
         HStack {
             if viewModel.isWorking {
-                if let transferProgress = viewModel.transferProgress {
-                    ProgressView(value: transferProgress)
-                        .frame(width: 110)
-                } else {
-                    ProgressView()
-                        .controlSize(.small)
-                }
+                ProgressView()
+                    .controlSize(.small)
             } else if viewModel.isIndexingRemoteFiles {
                 ProgressView()
                     .controlSize(.small)
@@ -559,32 +584,10 @@ struct ContentView: View {
             Text(viewModel.statusMessage)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            if viewModel.transferProgress != nil {
-                Text(transferDescription)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
             Spacer()
         }
         .padding(.horizontal)
         .padding(.vertical, 9)
-    }
-
-    private var transferDescription: String {
-        let rate = ByteCountFormatter.string(
-            fromByteCount: Int64(viewModel.transferRateBytesPerSecond),
-            countStyle: .file
-        )
-        guard viewModel.transferTotalBytes > 0 else { return "\(rate)/s" }
-        let transferred = ByteCountFormatter.string(
-            fromByteCount: Int64(viewModel.transferBytes),
-            countStyle: .file
-        )
-        let total = ByteCountFormatter.string(
-            fromByteCount: Int64(viewModel.transferTotalBytes),
-            countStyle: .file
-        )
-        return "\(transferred) / \(total) · \(rate)/s"
     }
 
     private func fileControls(
@@ -706,7 +709,9 @@ struct ContentView: View {
     }
 
     private func beginRemoteRename(_ file: RemoteFile) {
-        guard viewModel.isConnected, !viewModel.isWorking else { return }
+        guard viewModel.isConnected,
+              !viewModel.isWorking,
+              !viewModel.isTransferQueueActive else { return }
         viewModel.selectedRemoteFileIDs = [file.id]
         renamingRemoteFileID = file.id
         resetClickTracking()
@@ -734,6 +739,10 @@ struct ContentView: View {
     }
 
     private func handleRemoteClick(_ file: RemoteFile) {
+        guard !viewModel.isWorking else {
+            resetClickTracking()
+            return
+        }
         guard !isModifiedSelection else {
             resetClickTracking()
             return

@@ -65,6 +65,21 @@ final class AndroidDeviceViewModel {
         let folderID: UInt32?
     }
 
+    private struct RemoteSelectionTarget {
+        let directory: String
+        let name: String
+    }
+
+    private enum TransferRequest {
+        case upload(
+            localURL: URL,
+            remoteDirectory: String,
+            storageID: UInt32?,
+            folderID: UInt32?
+        )
+        case download(file: RemoteFile, destination: URL)
+    }
+
     var deviceDescription = "기기를 확인하는 중…"
     var isConnected = false
     var localDirectory = FileManager.default.homeDirectoryForCurrentUser
@@ -85,6 +100,7 @@ final class AndroidDeviceViewModel {
     var transferBytes: UInt64 = 0
     var transferTotalBytes: UInt64 = 0
     var transferRateBytesPerSecond: UInt64 = 0
+    var transferJobs: [TransferJob] = []
     var isShowingError = false
     var errorMessage = ""
 
@@ -99,10 +115,21 @@ final class AndroidDeviceViewModel {
     private var indexGeneration = UUID()
     private var transferStartedAt: Date?
     private var currentTransferID: UUID?
+    private var remoteSelectionAfterReload: RemoteSelectionTarget?
+    private var transferRequests: [UUID: TransferRequest] = [:]
+    private var filePromiseCompletions: [UUID: FilePromiseCompletion] = [:]
+    private var activeTransferProgress: Progress?
+    private var queueNeedsRemoteReload = false
+    private var queueNeedsLocalReload = false
     private var isAccessingLocalDirectory = false
-    private var activeFilePromises = 0
-    private var filePromiseTransferID: UUID?
-    private var failedFilePromises = 0
+
+    var isTransferQueueActive: Bool {
+        transferJobs.contains { $0.state == .waiting || $0.state == .transferring }
+    }
+
+    func progressForTransfer(id: UUID) -> Progress? {
+        currentTransferID == id ? activeTransferProgress : nil
+    }
 
     init(service: any MTPServicing) {
         self.service = service
@@ -116,6 +143,7 @@ final class AndroidDeviceViewModel {
     }
 
     func stop() {
+        cancelAllTransfers()
         connectionGeneration = UUID()
         isConnected = false
         isLoadingRemoteFiles = false
@@ -263,7 +291,7 @@ final class AndroidDeviceViewModel {
     }
 
     func refreshDevice() {
-        guard !isWorking else { return }
+        guard !isWorking, !isTransferQueueActive else { return }
         connectionGeneration = UUID()
         isConnected = false
         isLoadingRemoteFiles = true
@@ -415,7 +443,7 @@ final class AndroidDeviceViewModel {
     var selectedRemoteFile: RemoteFile? { selectedRemoteFiles.first }
 
     func createRemoteFolder() {
-        guard isConnected, !isWorking else { return }
+        guard isConnected, !isWorking, !isTransferQueueActive else { return }
         guard let name = requestName(
             title: "새 폴더",
             message: "Android의 현재 위치에 생성할 폴더 이름을 입력하세요.",
@@ -429,28 +457,55 @@ final class AndroidDeviceViewModel {
         let directory = remoteDirectory
         let storageID = remoteStorageID
         let folderID = remoteFolderID
+        let previousSelection = selectedRemoteFileIDs
+        let optimisticStorageID = storageID ?? remoteFiles.first?.storageID ?? 0
+        let optimisticFolder = RemoteFile(
+            objectID: optimisticRemoteObjectID(storageID: optimisticStorageID),
+            storageID: optimisticStorageID,
+            name: name,
+            isDirectory: true,
+            size: 0
+        )
+        insertRemoteFile(optimisticFolder)
+        selectedRemoteFileIDs = [optimisticFolder.id]
+        isWorking = true
+        statusMessage = "Android에 \(name) 폴더를 만드는 중…"
         let service = service
-        perform(status: "Android에 \(name) 폴더를 만드는 중…") {
-            try await service.createFolder(
-                name: name,
-                remoteDirectory: directory,
-                storageID: storageID,
-                folderID: folderID
-            )
-        } onSuccess: { [weak self] _ in
-            self?.markRemoteIndexStale()
-            self?.statusMessage = "\(name) 폴더를 만들었습니다."
-            self?.scheduleRemoteReload()
+        Task { [weak self] in
+            do {
+                try await service.createFolder(
+                    name: name,
+                    remoteDirectory: directory,
+                    storageID: storageID,
+                    folderID: folderID
+                )
+                await Task.yield()
+                guard let self else { return }
+                self.isWorking = false
+                self.remoteSelectionAfterReload = RemoteSelectionTarget(
+                    directory: directory,
+                    name: name
+                )
+                self.markRemoteIndexStale()
+                self.statusMessage = "\(name) 폴더를 만들었습니다."
+                self.reconcileRemoteFilesAfterMutation()
+            } catch {
+                await Task.yield()
+                guard let self else { return }
+                self.isWorking = false
+                self.removeRemoteFiles([optimisticFolder])
+                if self.remoteDirectory == directory {
+                    self.selectedRemoteFileIDs = previousSelection
+                }
+                self.showError(error)
+            }
         }
     }
 
     func renameRemoteFile(_ file: RemoteFile, to proposedName: String) {
-        guard isConnected, !isWorking else { return }
+        guard isConnected, !isWorking, !isTransferQueueActive else { return }
         let name = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty,
-              name != ".",
-              name != "..",
-              !name.contains("/") else {
+        guard isValidFileName(name) else {
             showError(MTPError("이름은 비어 있을 수 없으며 '/'를 포함할 수 없습니다."))
             return
         }
@@ -465,6 +520,7 @@ final class AndroidDeviceViewModel {
         updateRemoteFile(file, name: name)
         isWorking = true
         statusMessage = "\(file.name)의 이름을 \(name)(으)로 변경하는 중…"
+        let directory = remoteDirectory
         let service = service
         Task { [weak self] in
             do {
@@ -472,9 +528,13 @@ final class AndroidDeviceViewModel {
                 await Task.yield()
                 guard let self else { return }
                 self.isWorking = false
+                self.remoteSelectionAfterReload = RemoteSelectionTarget(
+                    directory: directory,
+                    name: name
+                )
                 self.markRemoteIndexStale()
                 self.statusMessage = "\(file.name)의 이름을 \(name)(으)로 변경했습니다."
-                self.scheduleRemoteReload()
+                self.reconcileRemoteFilesAfterMutation()
             } catch {
                 await Task.yield()
                 guard let self else { return }
@@ -487,7 +547,7 @@ final class AndroidDeviceViewModel {
 
     func deleteSelectedRemoteFiles() {
         let files = selectedRemoteFiles
-        guard isConnected, !isWorking, !files.isEmpty else { return }
+        guard isConnected, !isWorking, !isTransferQueueActive, !files.isEmpty else { return }
 
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -500,17 +560,42 @@ final class AndroidDeviceViewModel {
         alert.addButton(withTitle: "취소")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
+        let directory = remoteDirectory
+        let displayedFilesBeforeDeletion = remoteFiles
+        removeRemoteFiles(files)
+        selectedRemoteFileIDs = Set(filteredRemoteFiles.prefix(1).map(\.id))
+        isWorking = true
+        statusMessage = "Android 항목 \(files.count)개를 삭제하는 중…"
         let service = service
-        perform(status: "Android 항목 \(files.count)개를 삭제하는 중…") {
+        Task { [weak self] in
+            var failedFiles: [RemoteFile] = []
+            var failureMessages: [String] = []
             for file in files {
-                try await service.delete(file: file)
+                do {
+                    try await service.delete(file: file)
+                } catch {
+                    failedFiles.append(file)
+                    failureMessages.append("\(file.name): \(error.localizedDescription)")
+                }
             }
-            return files.count
-        } onFinish: { [weak self] in
-            self?.markRemoteIndexStale()
-            self?.scheduleRemoteReload()
-        } onSuccess: { [weak self] count in
-            self?.statusMessage = "Android 항목 \(count)개를 삭제했습니다."
+            await Task.yield()
+            guard let self else { return }
+
+            self.isWorking = false
+            self.markRemoteIndexStale()
+            if self.remoteDirectory == directory, !failedFiles.isEmpty {
+                self.restoreRemoteFiles(failedFiles, from: displayedFilesBeforeDeletion)
+                self.selectedRemoteFileIDs = Set(failedFiles.map(\.id))
+            }
+
+            let deletedCount = files.count - failedFiles.count
+            self.statusMessage = failedFiles.isEmpty
+                ? "Android 항목 \(deletedCount)개를 삭제했습니다."
+                : "Android 항목 \(deletedCount)개 삭제 · \(failedFiles.count)개 실패"
+            if !failureMessages.isEmpty {
+                self.showError(MTPError(failureMessages.joined(separator: "\n")))
+            }
+            self.reconcileRemoteFilesAfterMutation()
         }
     }
 
@@ -521,32 +606,21 @@ final class AndroidDeviceViewModel {
         let destination = remoteDirectory
         let destinationStorageID = remoteStorageID
         let destinationFolderID = remoteFolderID
-        let service = service
-        let transferID = beginTransferProgress()
 
-        perform(status: "파일을 Android로 전송하는 중…") {
-            for url in urls {
-                let allowed = url.startAccessingSecurityScopedResource()
-                defer { if allowed { url.stopAccessingSecurityScopedResource() } }
-                try await service.upload(
+        for url in urls {
+            enqueueTransfer(
+                name: url.lastPathComponent,
+                direction: .upload,
+                totalBytes: localItemSize(at: url),
+                request: .upload(
                     localURL: url,
                     remoteDirectory: destination,
                     storageID: destinationStorageID,
                     folderID: destinationFolderID
-                ) { [weak self] progress in
-                    Task { @MainActor [weak self] in
-                        self?.updateTransferProgress(progress, for: transferID)
-                    }
-                }
-            }
-            return urls.count
-        } onFinish: { [weak self] in
-            self?.finishTransferProgress(for: transferID)
-        } onSuccess: { [weak self] count in
-            self?.markRemoteIndexStale()
-            self?.statusMessage = "\(count)개 항목을 Android로 전송했습니다."
-            self?.scheduleRemoteReload()
+                )
+            )
         }
+        statusMessage = "Android 업로드 \(urls.count)개를 대기열에 추가했습니다."
     }
 
     func uploadSelectedLocalFiles() {
@@ -557,23 +631,16 @@ final class AndroidDeviceViewModel {
         let files = selectedRemoteFiles
         guard !isWorking, isConnected, !files.isEmpty else { return }
         guard let downloads = selectDownloadDestinations(for: files) else { return }
-        let service = service
-        let transferID = beginTransferProgress()
 
-        perform(status: "\(files.count)개 항목을 Mac으로 다운로드하는 중…") {
-            for (file, destination) in downloads {
-                try await service.download(file: file, destination: destination) { [weak self] progress in
-                    Task { @MainActor [weak self] in
-                        self?.updateTransferProgress(progress, for: transferID)
-                    }
-                }
-            }
-            return files.count
-        } onFinish: { [weak self] in
-            self?.finishTransferProgress(for: transferID)
-        } onSuccess: { [weak self] count in
-            self?.statusMessage = "\(count)개 항목을 다운로드했습니다."
+        for (file, destination) in downloads {
+            enqueueTransfer(
+                name: file.name,
+                direction: .download,
+                totalBytes: file.size,
+                request: .download(file: file, destination: destination)
+            )
         }
+        statusMessage = "Mac 다운로드 \(files.count)개를 대기열에 추가했습니다."
     }
 
     func filePromiseProvider(for file: RemoteFile) -> NSFilePromiseProvider {
@@ -587,26 +654,17 @@ final class AndroidDeviceViewModel {
                     completion(CancellationError())
                     return
                 }
-                guard self.isConnected,
-                      !self.isWorking || self.activeFilePromises > 0 else {
+                guard self.isConnected, !self.isWorking else {
                     completion(MTPError("다른 전송 작업이 진행 중이거나 기기가 연결되어 있지 않습니다."))
                     return
                 }
-
-                let transferID = self.beginFilePromiseTransfer()
-                do {
-                    try await self.service.download(file: file, destination: destination) { [weak self] value in
-                        Task { @MainActor [weak self] in
-                            self?.updateTransferProgress(value, for: transferID)
-                        }
-                    }
-                    self.finishFilePromiseTransfer(succeeded: true)
-                    completion(nil)
-                } catch {
-                    self.finishFilePromiseTransfer(succeeded: false)
-                    self.showError(error)
-                    completion(error)
-                }
+                let transferID = self.enqueueTransfer(
+                    name: file.name,
+                    direction: .download,
+                    totalBytes: file.size,
+                    request: .download(file: file, destination: destination)
+                )
+                self.filePromiseCompletions[transferID] = completion
             }
         }
         let provider = NSFilePromiseProvider(fileType: contentType.identifier, delegate: promiseDelegate)
@@ -669,6 +727,41 @@ final class AndroidDeviceViewModel {
         remoteFiles = remoteFiles.map(replace)
         cachedRootFiles = cachedRootFiles.map(replace)
         cachedFolderFiles = cachedFolderFiles.mapValues { $0.map(replace) }
+    }
+
+    private func optimisticRemoteObjectID(storageID: UInt32) -> UInt32 {
+        var candidate = UInt32.max
+        while remoteFiles.contains(where: {
+            $0.storageID == storageID && $0.objectID == candidate
+        }) {
+            candidate &-= 1
+        }
+        return candidate
+    }
+
+    private func insertRemoteFile(_ file: RemoteFile) {
+        remoteFiles.append(file)
+        if remoteDirectory == "/" {
+            cachedRootFiles = remoteFiles
+        } else if let storageID = remoteStorageID, let folderID = remoteFolderID {
+            cachedFolderFiles[RemoteFolderKey(storageID: storageID, folderID: folderID)] = remoteFiles
+        }
+    }
+
+    private func removeRemoteFiles(_ files: [RemoteFile]) {
+        let fileIDs = Set(files.map(\.id))
+        remoteFiles.removeAll { fileIDs.contains($0.id) }
+        cachedRootFiles.removeAll { fileIDs.contains($0.id) }
+        cachedFolderFiles = cachedFolderFiles.mapValues { cachedFiles in
+            cachedFiles.filter { !fileIDs.contains($0.id) }
+        }
+    }
+
+    private func restoreRemoteFiles(_ files: [RemoteFile], from snapshot: [RemoteFile]) {
+        let fileIDs = Set(files.map(\.id))
+        let restoredFiles = snapshot.filter { fileIDs.contains($0.id) }
+        let currentIDs = Set(remoteFiles.map(\.id))
+        remoteFiles.append(contentsOf: restoredFiles.filter { !currentIDs.contains($0.id) })
     }
 
     private func selectDownloadDestination(for file: RemoteFile) -> URL? {
@@ -738,46 +831,227 @@ final class AndroidDeviceViewModel {
         }
     }
 
-    private func beginTransferProgress() -> UUID {
-        let transferID = UUID()
-        currentTransferID = transferID
-        transferProgress = 0
+    @discardableResult
+    private func enqueueTransfer(
+        name: String,
+        direction: TransferDirection,
+        totalBytes: UInt64,
+        request: TransferRequest
+    ) -> UUID {
+        let id = UUID()
+        transferRequests[id] = request
+        transferJobs.append(
+            TransferJob(
+                id: id,
+                name: name,
+                direction: direction,
+                state: .waiting,
+                bytesTransferred: 0,
+                totalBytes: totalBytes,
+                bytesPerSecond: 0,
+                errorMessage: nil
+            )
+        )
+        startNextTransferIfNeeded()
+        return id
+    }
+
+    func cancelTransfer(id: UUID) {
+        guard let index = transferJobs.firstIndex(where: { $0.id == id }) else { return }
+        switch transferJobs[index].state {
+        case .waiting:
+            transferJobs[index].state = .cancelled
+            transferJobs[index].errorMessage = "사용자가 전송을 취소했습니다."
+            filePromiseCompletions.removeValue(forKey: id)?.callAsFunction(CancellationError())
+        case .transferring:
+            guard currentTransferID == id else { return }
+            activeTransferProgress?.cancel()
+            statusMessage = "\(transferJobs[index].name) 전송을 취소하는 중…"
+        case .completed, .failed, .cancelled:
+            return
+        }
+        startNextTransferIfNeeded()
+    }
+
+    func cancelAllTransfers() {
+        activeTransferProgress?.cancel()
+        for index in transferJobs.indices where transferJobs[index].state == .waiting {
+            let id = transferJobs[index].id
+            transferJobs[index].state = .cancelled
+            transferJobs[index].errorMessage = "사용자가 전송을 취소했습니다."
+            filePromiseCompletions.removeValue(forKey: id)?.callAsFunction(CancellationError())
+        }
+    }
+
+    func retryTransfer(id: UUID) {
+        guard isConnected,
+              let index = transferJobs.firstIndex(where: { $0.id == id }),
+              transferJobs[index].canRetry,
+              transferRequests[id] != nil else { return }
+        transferJobs[index].state = .waiting
+        transferJobs[index].bytesTransferred = 0
+        transferJobs[index].bytesPerSecond = 0
+        transferJobs[index].errorMessage = nil
+        startNextTransferIfNeeded()
+    }
+
+    func retryFailedTransfers() {
+        guard isConnected else { return }
+        for index in transferJobs.indices
+        where transferJobs[index].canRetry && transferRequests[transferJobs[index].id] != nil {
+            transferJobs[index].state = .waiting
+            transferJobs[index].bytesTransferred = 0
+            transferJobs[index].bytesPerSecond = 0
+            transferJobs[index].errorMessage = nil
+        }
+        startNextTransferIfNeeded()
+    }
+
+    func clearFinishedTransfers() {
+        let removableIDs = Set(
+            transferJobs.lazy
+                .filter { !$0.canCancel }
+                .map(\.id)
+        )
+        transferJobs.removeAll { removableIDs.contains($0.id) }
+        for id in removableIDs {
+            transferRequests.removeValue(forKey: id)
+            filePromiseCompletions.removeValue(forKey: id)
+        }
+    }
+
+    private func startNextTransferIfNeeded() {
+        guard currentTransferID == nil, isConnected,
+              let index = transferJobs.firstIndex(where: { $0.state == .waiting }) else {
+            if currentTransferID == nil {
+                finishTransferQueueIfNeeded()
+            }
+            return
+        }
+
+        let id = transferJobs[index].id
+        let cancellation = TransferCancellationToken()
+        let foundationProgress = Progress(
+            totalUnitCount: max(Int64(clamping: transferJobs[index].totalBytes), 1)
+        )
+        foundationProgress.isCancellable = true
+        foundationProgress.isPausable = false
+        foundationProgress.cancellationHandler = {
+            cancellation.cancel()
+        }
+
+        transferJobs[index].state = .transferring
+        transferJobs[index].errorMessage = nil
+        currentTransferID = id
+        activeTransferProgress = foundationProgress
+        transferProgress = transferJobs[index].totalBytes > 0 ? 0 : nil
         transferBytes = 0
-        transferTotalBytes = 0
+        transferTotalBytes = transferJobs[index].totalBytes
         transferRateBytesPerSecond = 0
         transferStartedAt = Date()
-        return transferID
+        statusMessage = "\(transferJobs[index].name)을(를) 전송하는 중…"
+
+        Task { [weak self] in
+            await self?.executeTransfer(id: id, cancellation: cancellation)
+        }
     }
 
-    private func beginFilePromiseTransfer() -> UUID {
-        if activeFilePromises == 0 {
-            filePromiseTransferID = beginTransferProgress()
-            failedFilePromises = 0
+    private func executeTransfer(id: UUID, cancellation: TransferCancellationToken) async {
+        guard let request = transferRequests[id] else {
+            finishTransfer(id: id, error: MTPError("전송 정보를 찾지 못했습니다."))
+            return
         }
-        activeFilePromises += 1
-        isWorking = true
-        statusMessage = "\(activeFilePromises)개 Android 항목을 Mac으로 전송하는 중…"
-        guard let filePromiseTransferID else {
-            preconditionFailure("파일 약속 전송 ID가 준비되지 않았습니다.")
+
+        do {
+            switch request {
+            case let .upload(localURL, remoteDirectory, storageID, folderID):
+                queueNeedsRemoteReload = true
+                let allowed = localURL.startAccessingSecurityScopedResource()
+                defer { if allowed { localURL.stopAccessingSecurityScopedResource() } }
+                try await service.upload(
+                    localURL: localURL,
+                    remoteDirectory: remoteDirectory,
+                    storageID: storageID,
+                    folderID: folderID,
+                    cancellation: cancellation
+                ) { [weak self] value in
+                    Task { @MainActor [weak self] in
+                        self?.updateTransferProgress(value, for: id)
+                    }
+                }
+            case let .download(file, destination):
+                queueNeedsLocalReload = true
+                try await service.download(
+                    file: file,
+                    destination: destination,
+                    cancellation: cancellation
+                ) { [weak self] value in
+                    Task { @MainActor [weak self] in
+                        self?.updateTransferProgress(value, for: id)
+                    }
+                }
+            }
+            finishTransfer(id: id, error: nil)
+        } catch {
+            finishTransfer(id: id, error: error)
         }
-        return filePromiseTransferID
     }
 
-    private func finishFilePromiseTransfer(succeeded: Bool) {
-        if !succeeded {
-            failedFilePromises += 1
+    private func finishTransfer(id: UUID, error: Error?) {
+        guard let index = transferJobs.firstIndex(where: { $0.id == id }) else { return }
+        let wasCancelled = activeTransferProgress?.isCancelled == true || error is CancellationError
+        if let error {
+            transferJobs[index].state = wasCancelled ? .cancelled : .failed
+            transferJobs[index].errorMessage = wasCancelled
+                ? "사용자가 전송을 취소했습니다."
+                : error.localizedDescription
+        } else {
+            transferJobs[index].state = .completed
+            transferJobs[index].bytesTransferred = max(
+                transferJobs[index].bytesTransferred,
+                transferJobs[index].totalBytes
+            )
+            transferJobs[index].errorMessage = nil
         }
-        activeFilePromises = max(activeFilePromises - 1, 0)
-        guard activeFilePromises == 0 else { return }
 
-        if let filePromiseTransferID {
-            finishTransferProgress(for: filePromiseTransferID)
+        let completion = filePromiseCompletions.removeValue(forKey: id)
+        if wasCancelled {
+            completion?.callAsFunction(CancellationError())
+        } else {
+            completion?.callAsFunction(error)
         }
-        self.filePromiseTransferID = nil
-        isWorking = false
-        statusMessage = failedFilePromises == 0
-            ? "선택한 Android 항목을 Mac으로 전송했습니다."
-            : "Android 항목 \(failedFilePromises)개를 전송하지 못했습니다."
+
+        finishTransferProgress(for: id)
+        activeTransferProgress = nil
+        startNextTransferIfNeeded()
+    }
+
+    private func finishTransferQueueIfNeeded() {
+        guard !transferJobs.contains(where: { $0.state == .waiting || $0.state == .transferring }) else {
+            return
+        }
+        if queueNeedsRemoteReload {
+            queueNeedsRemoteReload = false
+            markRemoteIndexStale()
+            reconcileRemoteFilesAfterMutation()
+        }
+        if queueNeedsLocalReload {
+            queueNeedsLocalReload = false
+            loadLocalFiles()
+        }
+
+        let completed = transferJobs.lazy.filter { $0.state == .completed }.count
+        let failed = transferJobs.lazy.filter { $0.state == .failed }.count
+        let cancelled = transferJobs.lazy.filter { $0.state == .cancelled }.count
+        if completed + failed + cancelled > 0 {
+            statusMessage = "전송 완료 \(completed)개 · 실패 \(failed)개 · 취소 \(cancelled)개"
+        }
+    }
+
+    private func localItemSize(at url: URL) -> UInt64 {
+        let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
+        guard values?.isDirectory != true else { return 0 }
+        return UInt64(values?.fileSize ?? 0)
     }
 
     private func updateTransferProgress(_ progress: TransferProgress, for transferID: UUID) {
@@ -793,6 +1067,12 @@ final class AndroidDeviceViewModel {
             ? min(Double(progress.bytesTransferred) / Double(progress.totalBytes), 1)
             : nil
         transferRateBytesPerSecond = UInt64(Double(progress.bytesTransferred) / elapsed)
+        activeTransferProgress?.totalUnitCount = max(Int64(clamping: progress.totalBytes), 1)
+        activeTransferProgress?.completedUnitCount = Int64(clamping: progress.bytesTransferred)
+        guard let index = transferJobs.firstIndex(where: { $0.id == transferID }) else { return }
+        transferJobs[index].bytesTransferred = progress.bytesTransferred
+        transferJobs[index].totalBytes = progress.totalBytes
+        transferJobs[index].bytesPerSecond = transferRateBytesPerSecond
     }
 
     private func finishTransferProgress(for transferID: UUID) {
@@ -877,7 +1157,16 @@ final class AndroidDeviceViewModel {
             cachedFolderFiles[folderKey] = files
         }
         remoteFiles = files
-        selectedRemoteFileIDs = Set(filteredRemoteFiles.prefix(1).map(\.id))
+        if let selectionTarget = remoteSelectionAfterReload,
+           selectionTarget.directory == directory,
+           let selectedFile = filteredRemoteFiles.first(where: { $0.name == selectionTarget.name }) {
+            selectedRemoteFileIDs = [selectedFile.id]
+        } else {
+            selectedRemoteFileIDs = Set(filteredRemoteFiles.prefix(1).map(\.id))
+        }
+        if remoteSelectionAfterReload?.directory == directory {
+            remoteSelectionAfterReload = nil
+        }
         statusMessage = "\(files.count)개 항목을 불러왔습니다."
         if directory == "/", !hasRemoteIndex {
             startRemoteIndexing()
@@ -968,6 +1257,40 @@ final class AndroidDeviceViewModel {
         Task { @MainActor [weak self] in
             await Task.yield()
             self?.loadRemoteFiles(forceRefresh: true)
+        }
+    }
+
+    private func reconcileRemoteFilesAfterMutation() {
+        let directory = remoteDirectory
+        let storageID = remoteStorageID
+        let folderID = remoteFolderID
+        let service = service
+
+        Task { [weak self] in
+            do {
+                let files: [RemoteFile]
+                let folderKey: RemoteFolderKey?
+                if let storageID, let folderID {
+                    files = try await service.listChildren(
+                        storageID: storageID,
+                        folderID: folderID
+                    ).sorted { lhs, rhs in
+                        lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+                    }
+                    folderKey = RemoteFolderKey(storageID: storageID, folderID: folderID)
+                } else {
+                    files = try await service.list(path: directory).sorted { lhs, rhs in
+                        lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+                    }
+                    folderKey = nil
+                }
+
+                await Task.yield()
+                guard let self, self.remoteDirectory == directory else { return }
+                self.receiveRemoteFiles(files, for: directory, folderKey: folderKey)
+            } catch {
+                // 낙관적 결과를 유지하고 사용자가 명시적으로 새로고침할 때 다시 동기화한다.
+            }
         }
     }
 
