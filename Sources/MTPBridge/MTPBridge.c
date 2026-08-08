@@ -754,6 +754,7 @@ int ad_mtp_list_children(ADMTPConnection *connection,
 
 static int ad_mtp_send_path(LIBMTP_mtpdevice_t *device,
                             const char *local_path,
+                            const char *target_name,
                             uint32_t storage_id,
                             uint32_t parent_id,
                             const ADMTPProgressContext *progress,
@@ -767,8 +768,11 @@ static int ad_mtp_send_path(LIBMTP_mtpdevice_t *device,
         return -1;
     }
 
-    const char *name = strrchr(local_path, '/');
-    name = name == NULL ? local_path : name + 1;
+    const char *name = target_name;
+    if (name == NULL || name[0] == '\0') {
+        name = strrchr(local_path, '/');
+        name = name == NULL ? local_path : name + 1;
+    }
     if (name[0] == '\0') {
         ad_mtp_set_error(error_message, "전송할 항목 이름을 읽지 못했습니다.");
         return -1;
@@ -814,7 +818,8 @@ static int ad_mtp_send_path(LIBMTP_mtpdevice_t *device,
                 break;
             }
             snprintf(child_path, path_length, "%s/%s", local_path, entry->d_name);
-            result = ad_mtp_send_path(device, child_path, storage_id, folder_id,
+            result = ad_mtp_send_path(device, child_path, NULL,
+                                      storage_id, folder_id,
                                       progress, error_message);
             free(child_path);
             if (result != 0) {
@@ -859,7 +864,8 @@ static int ad_mtp_send_path(LIBMTP_mtpdevice_t *device,
 }
 
 int ad_mtp_upload(ADMTPConnection *connection,
-                  const char *local_path, const char *remote_directory,
+                  const char *local_path, const char *remote_name,
+                  const char *remote_directory,
                   ADMTPProgressCallback progress_callback, void *progress_context,
                   char **error_message) {
     if (error_message != NULL) *error_message = NULL;
@@ -877,14 +883,15 @@ int ad_mtp_upload(ADMTPConnection *connection,
         .callback = progress_callback,
         .context = progress_context,
     };
-    int result = ad_mtp_send_path(device, local_path, location.storage_id,
+    int result = ad_mtp_send_path(device, local_path, remote_name,
+                                  location.storage_id,
                                   location.folder_id, &progress, error_message);
     ad_mtp_clear_index(connection);
     return result;
 }
 
 int ad_mtp_upload_to_folder(ADMTPConnection *connection,
-                            const char *local_path,
+                            const char *local_path, const char *remote_name,
                             uint32_t storage_id, uint32_t folder_id,
                             ADMTPProgressCallback progress_callback,
                             void *progress_context, char **error_message) {
@@ -898,7 +905,8 @@ int ad_mtp_upload_to_folder(ADMTPConnection *connection,
         .callback = progress_callback,
         .context = progress_context,
     };
-    int result = ad_mtp_send_path(device, local_path, storage_id, folder_id,
+    int result = ad_mtp_send_path(device, local_path, remote_name,
+                                  storage_id, folder_id,
                                   &progress, error_message);
     ad_mtp_clear_index(connection);
     return result;

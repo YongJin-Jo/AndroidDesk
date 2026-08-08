@@ -70,14 +70,27 @@ final class AndroidDeviceViewModel {
         let name: String
     }
 
+    private enum CollisionResolution {
+        case replace
+        case keepBoth
+        case skip
+    }
+
+    private struct CollisionDecision {
+        let resolution: CollisionResolution
+        let appliesToAll: Bool
+    }
+
     private enum TransferRequest {
         case upload(
             localURL: URL,
+            remoteName: String,
             remoteDirectory: String,
             storageID: UInt32?,
-            folderID: UInt32?
+            folderID: UInt32?,
+            replacing: RemoteFile?
         )
-        case download(file: RemoteFile, destination: URL)
+        case download(file: RemoteFile, destination: URL, replaceExisting: Bool)
     }
 
     var deviceDescription = "기기를 확인하는 중…"
@@ -195,18 +208,19 @@ final class AndroidDeviceViewModel {
         loadLocalFiles()
     }
 
-    func createLocalFolder() {
-        guard !isWorking else { return }
-        guard let name = requestName(
-            title: "새 폴더",
-            message: "Mac의 현재 위치에 생성할 폴더 이름을 입력하세요.",
-            initialValue: "새 폴더"
-        ) else { return }
+    @discardableResult
+    func createLocalFolder(named proposedName: String) -> Bool {
+        guard !isWorking else { return false }
+        let name = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isValidFileName(name) else {
+            showError(MTPError("이름은 비어 있을 수 없으며 '/'를 포함할 수 없습니다."))
+            return false
+        }
 
         let folderURL = localDirectory.appendingPathComponent(name, isDirectory: true)
         guard !FileManager.default.fileExists(atPath: folderURL.path) else {
             showError(MTPError("\(name)과(와) 같은 이름의 항목이 이미 있습니다."))
-            return
+            return false
         }
 
         do {
@@ -217,8 +231,10 @@ final class AndroidDeviceViewModel {
             loadLocalFiles()
             selectedLocalFileIDs = [folderURL]
             statusMessage = "Mac에 \(name) 폴더를 만들었습니다."
+            return true
         } catch {
             showError(error)
+            return false
         }
     }
 
@@ -447,16 +463,17 @@ final class AndroidDeviceViewModel {
     var selectedLocalFile: LocalFile? { selectedLocalFiles.first }
     var selectedRemoteFile: RemoteFile? { selectedRemoteFiles.first }
 
-    func createRemoteFolder() {
-        guard isConnected, !isWorking, !isTransferQueueActive else { return }
-        guard let name = requestName(
-            title: "새 폴더",
-            message: "Android의 현재 위치에 생성할 폴더 이름을 입력하세요.",
-            initialValue: "새 폴더"
-        ) else { return }
+    @discardableResult
+    func createRemoteFolder(named proposedName: String) -> Bool {
+        guard isConnected, !isWorking, !isTransferQueueActive else { return false }
+        let name = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isValidFileName(name) else {
+            showError(MTPError("이름은 비어 있을 수 없으며 '/'를 포함할 수 없습니다."))
+            return false
+        }
         guard !remoteFiles.contains(where: { $0.name == name }) else {
             showError(MTPError("\(name)과(와) 같은 이름의 항목이 이미 있습니다."))
-            return
+            return false
         }
 
         let directory = remoteDirectory
@@ -507,6 +524,7 @@ final class AndroidDeviceViewModel {
                 self.showError(error)
             }
         }
+        return true
     }
 
     func renameRemoteFile(_ file: RemoteFile, to proposedName: String) {
@@ -613,21 +631,66 @@ final class AndroidDeviceViewModel {
         let destination = remoteDirectory
         let destinationStorageID = remoteStorageID
         let destinationFolderID = remoteFolderID
+        var collisionPolicy: CollisionResolution?
+        var queuedCount = 0
+        var skippedCount = 0
+        var occupiedNames = Set(remoteFiles.map { $0.name.lowercased() })
 
         for url in urls {
+            let originalName = url.lastPathComponent
+            let existingFile = remoteFiles.first {
+                $0.name.localizedCaseInsensitiveCompare(originalName) == .orderedSame
+            }
+            var remoteName = originalName
+            var replacing: RemoteFile?
+            if let existingFile {
+                let resolution: CollisionResolution
+                if let collisionPolicy {
+                    resolution = collisionPolicy
+                } else {
+                    let decision = presentCollisionAlert(
+                        itemName: originalName,
+                        destinationDescription: "Android의 \(destination)",
+                        allowsApplyToAll: urls.count > 1
+                    )
+                    resolution = decision.resolution
+                    if decision.appliesToAll {
+                        collisionPolicy = resolution
+                    }
+                }
+                switch resolution {
+                case .replace:
+                    replacing = existingFile
+                case .keepBoth:
+                    remoteName = availableCopyName(
+                        for: originalName,
+                        isDirectory: existingFile.isDirectory,
+                        occupiedNames: occupiedNames
+                    )
+                case .skip:
+                    skippedCount += 1
+                    continue
+                }
+            }
+            occupiedNames.insert(remoteName.lowercased())
             enqueueTransfer(
-                name: url.lastPathComponent,
+                name: remoteName,
                 direction: .upload,
                 totalBytes: localItemSize(at: url),
                 request: .upload(
                     localURL: url,
+                    remoteName: remoteName,
                     remoteDirectory: destination,
                     storageID: destinationStorageID,
-                    folderID: destinationFolderID
+                    folderID: destinationFolderID,
+                    replacing: replacing
                 )
             )
+            queuedCount += 1
         }
-        statusMessage = "Android 업로드 \(urls.count)개를 대기열에 추가했습니다."
+        statusMessage = skippedCount > 0
+            ? "Android 업로드 \(queuedCount)개 대기 · \(skippedCount)개 건너뜀"
+            : "Android 업로드 \(queuedCount)개를 대기열에 추가했습니다."
     }
 
     func uploadSelectedLocalFiles() {
@@ -639,15 +702,58 @@ final class AndroidDeviceViewModel {
         guard !isWorking, isConnected, !files.isEmpty else { return }
         guard let downloads = selectDownloadDestinations(for: files) else { return }
 
-        for (file, destination) in downloads {
+        var collisionPolicy: CollisionResolution?
+        var queuedCount = 0
+        var skippedCount = 0
+        var reservedDestinations: Set<String> = []
+        for (file, proposedDestination) in downloads {
+            var destination = proposedDestination
+            var replaceExisting = false
+            if FileManager.default.fileExists(atPath: destination.path) {
+                let resolution: CollisionResolution
+                if let collisionPolicy {
+                    resolution = collisionPolicy
+                } else {
+                    let decision = presentCollisionAlert(
+                        itemName: file.name,
+                        destinationDescription: destination.deletingLastPathComponent().path,
+                        allowsApplyToAll: files.count > 1
+                    )
+                    resolution = decision.resolution
+                    if decision.appliesToAll {
+                        collisionPolicy = resolution
+                    }
+                }
+                switch resolution {
+                case .replace:
+                    replaceExisting = true
+                case .keepBoth:
+                    destination = availableLocalDestination(
+                        for: destination,
+                        isDirectory: file.isDirectory,
+                        reservedPaths: reservedDestinations
+                    )
+                case .skip:
+                    skippedCount += 1
+                    continue
+                }
+            }
+            reservedDestinations.insert(destination.path)
             enqueueTransfer(
-                name: file.name,
+                name: destination.lastPathComponent,
                 direction: .download,
                 totalBytes: file.size,
-                request: .download(file: file, destination: destination)
+                request: .download(
+                    file: file,
+                    destination: destination,
+                    replaceExisting: replaceExisting
+                )
             )
+            queuedCount += 1
         }
-        statusMessage = "Mac 다운로드 \(files.count)개를 대기열에 추가했습니다."
+        statusMessage = skippedCount > 0
+            ? "Mac 다운로드 \(queuedCount)개 대기 · \(skippedCount)개 건너뜀"
+            : "Mac 다운로드 \(queuedCount)개를 대기열에 추가했습니다."
     }
 
     func filePromiseProvider(for file: RemoteFile) -> NSFilePromiseProvider {
@@ -669,7 +775,11 @@ final class AndroidDeviceViewModel {
                     name: file.name,
                     direction: .download,
                     totalBytes: file.size,
-                    request: .download(file: file, destination: destination)
+                    request: .download(
+                        file: file,
+                        destination: destination,
+                        replaceExisting: false
+                    )
                 )
                 self.filePromiseCompletions[transferID] = completion
             }
@@ -686,32 +796,6 @@ final class AndroidDeviceViewModel {
             loadLocalFiles()
             statusMessage = "\(name)을(를) Mac 폴더로 복사했습니다."
         }
-    }
-
-    private func requestName(
-        title: String,
-        message: String,
-        initialValue: String
-    ) -> String? {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        alert.addButton(withTitle: "확인")
-        alert.addButton(withTitle: "취소")
-
-        let nameField = NSTextField(string: initialValue)
-        nameField.frame = NSRect(x: 0, y: 0, width: 320, height: 24)
-        alert.accessoryView = nameField
-        alert.window.initialFirstResponder = nameField
-        nameField.selectText(nil)
-
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-        let name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard isValidFileName(name) else {
-            showError(MTPError("이름은 비어 있을 수 없으며 '/'를 포함할 수 없습니다."))
-            return nil
-        }
-        return name
     }
 
     private func isValidFileName(_ name: String) -> Bool {
@@ -771,6 +855,82 @@ final class AndroidDeviceViewModel {
         let restoredFiles = snapshot.filter { fileIDs.contains($0.id) }
         let currentIDs = Set(remoteFiles.map(\.id))
         remoteFiles.append(contentsOf: restoredFiles.filter { !currentIDs.contains($0.id) })
+    }
+
+    private func presentCollisionAlert(
+        itemName: String,
+        destinationDescription: String,
+        allowsApplyToAll: Bool
+    ) -> CollisionDecision {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "\(itemName)과(와) 같은 이름의 항목이 이미 있습니다."
+        alert.informativeText = "대상 위치: \(destinationDescription)"
+        let replaceButton = alert.addButton(withTitle: "대치")
+        replaceButton.hasDestructiveAction = true
+        alert.addButton(withTitle: "둘 다 유지")
+        alert.addButton(withTitle: "건너뛰기")
+        if allowsApplyToAll {
+            alert.showsSuppressionButton = true
+            alert.suppressionButton?.title = "이후 충돌에 모두 적용"
+        }
+
+        let response = alert.runModal()
+        let resolution: CollisionResolution
+        switch response {
+        case .alertFirstButtonReturn:
+            resolution = .replace
+        case .alertSecondButtonReturn:
+            resolution = .keepBoth
+        default:
+            resolution = .skip
+        }
+        return CollisionDecision(
+            resolution: resolution,
+            appliesToAll: allowsApplyToAll && alert.suppressionButton?.state == .on
+        )
+    }
+
+    private func availableCopyName(
+        for name: String,
+        isDirectory: Bool,
+        occupiedNames: Set<String>
+    ) -> String {
+        let path = name as NSString
+        let pathExtension = isDirectory ? "" : path.pathExtension
+        let stem = pathExtension.isEmpty ? name : path.deletingPathExtension
+        var suffix = 2
+        var candidate = name
+        repeat {
+            let numberedStem = "\(stem) \(suffix)"
+            candidate = pathExtension.isEmpty
+                ? numberedStem
+                : "\(numberedStem).\(pathExtension)"
+            suffix += 1
+        } while occupiedNames.contains(candidate.lowercased())
+        return candidate
+    }
+
+    private func availableLocalDestination(
+        for destination: URL,
+        isDirectory: Bool,
+        reservedPaths: Set<String>
+    ) -> URL {
+        let directory = destination.deletingLastPathComponent()
+        let occupiedNames = Set(
+            ((try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil
+            )) ?? []).map { $0.lastPathComponent.lowercased() }
+        ).union(
+            reservedPaths.map { URL(fileURLWithPath: $0).lastPathComponent.lowercased() }
+        )
+        let name = availableCopyName(
+            for: destination.lastPathComponent,
+            isDirectory: isDirectory,
+            occupiedNames: occupiedNames
+        )
+        return directory.appendingPathComponent(name, isDirectory: isDirectory)
     }
 
     private func selectDownloadDestination(for file: RemoteFile) -> URL? {
@@ -973,12 +1133,23 @@ final class AndroidDeviceViewModel {
 
         do {
             switch request {
-            case let .upload(localURL, remoteDirectory, storageID, folderID):
+            case let .upload(
+                localURL,
+                remoteName,
+                remoteDirectory,
+                storageID,
+                folderID,
+                replacing
+            ):
                 queueNeedsRemoteReload = true
                 let allowed = localURL.startAccessingSecurityScopedResource()
                 defer { if allowed { localURL.stopAccessingSecurityScopedResource() } }
+                if let replacing {
+                    try await service.delete(file: replacing)
+                }
                 try await service.upload(
                     localURL: localURL,
+                    remoteName: remoteName,
                     remoteDirectory: remoteDirectory,
                     storageID: storageID,
                     folderID: folderID,
@@ -988,8 +1159,12 @@ final class AndroidDeviceViewModel {
                         self?.updateTransferProgress(value, for: id)
                     }
                 }
-            case let .download(file, destination):
+            case let .download(file, destination, replaceExisting):
                 queueNeedsLocalReload = true
+                if replaceExisting,
+                   FileManager.default.fileExists(atPath: destination.path) {
+                    try FileManager.default.removeItem(at: destination)
+                }
                 try await service.download(
                     file: file,
                     destination: destination,

@@ -10,6 +10,7 @@ protocol MTPServicing: Sendable {
     func listChildren(storageID: UInt32, folderID: UInt32) async throws -> [RemoteFile]
     func upload(
         localURL: URL,
+        remoteName: String,
         remoteDirectory: String,
         storageID: UInt32?,
         folderID: UInt32?,
@@ -173,6 +174,7 @@ actor MTPService: MTPServicing {
 
     func upload(
         localURL: URL,
+        remoteName: String,
         remoteDirectory: String,
         storageID: UInt32?,
         folderID: UInt32?,
@@ -184,26 +186,30 @@ actor MTPService: MTPServicing {
         let reporter = MTPProgressReporter(cancellation: cancellation, report: progress)
         let progressContext = Unmanaged.passUnretained(reporter).toOpaque()
         let result = localURL.path.withCString { localPath in
-            if let storageID, let folderID {
-                return ad_mtp_upload_to_folder(
-                    connection,
-                    localPath,
-                    storageID,
-                    folderID,
-                    mtpProgressCallback,
-                    progressContext,
-                    &errorMessage
-                )
-            }
-            return remoteDirectory.withCString { remotePath in
-                ad_mtp_upload(
-                    connection,
-                    localPath,
-                    remotePath,
-                    mtpProgressCallback,
-                    progressContext,
-                    &errorMessage
-                )
+            remoteName.withCString { targetName in
+                if let storageID, let folderID {
+                    return ad_mtp_upload_to_folder(
+                        connection,
+                        localPath,
+                        targetName,
+                        storageID,
+                        folderID,
+                        mtpProgressCallback,
+                        progressContext,
+                        &errorMessage
+                    )
+                }
+                return remoteDirectory.withCString { remotePath in
+                    ad_mtp_upload(
+                        connection,
+                        localPath,
+                        targetName,
+                        remotePath,
+                        mtpProgressCallback,
+                        progressContext,
+                        &errorMessage
+                    )
+                }
             }
         }
         defer { ad_mtp_free_string(errorMessage) }

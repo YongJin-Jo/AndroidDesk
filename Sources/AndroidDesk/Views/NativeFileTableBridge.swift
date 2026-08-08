@@ -127,6 +127,9 @@ struct NativeFileTableBridge: NSViewRepresentable {
                 forRowIndexes: rows,
                 columnIndexes: IndexSet(integersIn: 0..<tableView.numberOfColumns)
             )
+            if let newEditingRow, tableView.numberOfRows > newEditingRow {
+                tableView.scrollRowToVisible(newEditingRow)
+            }
         }
 
         private func handle(_ eventBox: TableEventBox) {

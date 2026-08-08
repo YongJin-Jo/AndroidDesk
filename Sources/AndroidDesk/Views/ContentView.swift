@@ -87,6 +87,8 @@ struct ContentView: View {
     @State private var nativeDragSource: NativeDragSource?
     @State private var renamingLocalFileID: LocalFile.ID?
     @State private var renamingRemoteFileID: RemoteFile.ID?
+    @State private var pendingLocalFolder: LocalFile?
+    @State private var pendingRemoteFolder: RemoteFile?
     @State private var localSortOrder = [KeyPathComparator(\LocalFile.name)]
     @State private var remoteSortOrder = [KeyPathComparator(\RemoteTableRow.sortableName)]
 
@@ -128,6 +130,7 @@ struct ContentView: View {
             viewModel.start()
         }
         .onChange(of: viewModel.remoteDirectory, initial: true) { _, path in
+            cancelRemoteRename()
             remotePathInput = path
         }
         .onChange(of: viewModel.localDirectory) { _, _ in
@@ -184,7 +187,7 @@ struct ContentView: View {
                     .font(.headline)
                 Spacer()
                 Button {
-                    viewModel.createLocalFolder()
+                    beginLocalFolderCreation()
                 } label: {
                     Label("새 폴더", systemImage: "folder.badge.plus")
                 }
@@ -312,7 +315,9 @@ struct ContentView: View {
                     dragWriters: { indexes in
                         indexes.compactMap { index in
                             guard displayedLocalFiles.indices.contains(index) else { return nil }
-                            return displayedLocalFiles[index].url as NSURL as any NSPasteboardWriting
+                            let file = displayedLocalFiles[index]
+                            guard file.id != pendingLocalFolder?.id else { return nil }
+                            return file.url as NSURL as any NSPasteboardWriting
                         }
                     },
                     onDragBegan: {
@@ -325,13 +330,13 @@ struct ContentView: View {
                         displayedLocalFiles.firstIndex { $0.id == fileID }
                     },
                     onCreateFolder: {
-                        viewModel.createLocalFolder()
+                        beginLocalFolderCreation()
                     }
                 )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .overlay {
-                if viewModel.filteredLocalFiles.isEmpty {
+                if displayedLocalFiles.isEmpty {
                     ContentUnavailableView(
                         viewModel.localSearchText.isEmpty ? "표시할 파일이 없습니다" : "검색 결과가 없습니다",
                         systemImage: "folder",
@@ -386,7 +391,7 @@ struct ContentView: View {
                     .font(.headline)
                 Spacer()
                 Button {
-                    viewModel.createRemoteFolder()
+                    beginRemoteFolderCreation()
                 } label: {
                     Label("새 폴더", systemImage: "folder.badge.plus")
                 }
@@ -484,8 +489,10 @@ struct ContentView: View {
                     dragWriters: { indexes in
                         indexes.compactMap { index in
                             guard displayedRemoteFiles.indices.contains(index) else { return nil }
+                            let file = displayedRemoteFiles[index]
+                            guard file.id != pendingRemoteFolder?.id else { return nil }
                             return viewModel.filePromiseProvider(
-                                for: displayedRemoteFiles[index]
+                                for: file
                             ) as any NSPasteboardWriting
                         }
                     },
@@ -499,7 +506,7 @@ struct ContentView: View {
                         displayedRemoteFiles.firstIndex { $0.id == fileID }
                     },
                     onCreateFolder: viewModel.isLoadingRemoteFiles || viewModel.isTransferQueueActive ? nil : {
-                        viewModel.createRemoteFolder()
+                        beginRemoteFolderCreation()
                     }
                 )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -516,6 +523,7 @@ struct ContentView: View {
                         .padding(4)
                 } else if !viewModel.isLoadingRemoteFiles
                             && viewModel.filteredRemoteFiles.isEmpty
+                            && pendingRemoteFolder == nil
                             && !viewModel.isWorking {
                     ContentUnavailableView(
                         viewModel.remoteSearchText.isEmpty ? "표시할 파일이 없습니다" : "검색 결과가 없습니다",
@@ -574,13 +582,21 @@ struct ContentView: View {
                 RemoteTableRow(placeholderIndex: $0.offset, name: $0.element)
             }
         }
-        return viewModel.filteredRemoteFiles
+        var files = viewModel.filteredRemoteFiles
+        if let pendingRemoteFolder {
+            files.append(pendingRemoteFolder)
+        }
+        return files
             .map(RemoteTableRow.init(file:))
             .sorted(using: remoteSortOrder)
     }
 
     private var displayedLocalFiles: [LocalFile] {
-        viewModel.filteredLocalFiles.sorted(using: localSortOrder)
+        var files = viewModel.filteredLocalFiles
+        if let pendingLocalFolder {
+            files.append(pendingLocalFolder)
+        }
+        return files.sorted(using: localSortOrder)
     }
 
     private var displayedRemoteFiles: [RemoteFile] {
@@ -804,12 +820,40 @@ struct ContentView: View {
 
     private func finishLocalRename(_ file: LocalFile, name: String) {
         guard renamingLocalFileID == file.id else { return }
+        if pendingLocalFolder?.id == file.id {
+            pendingLocalFolder = nil
+            renamingLocalFileID = nil
+            viewModel.selectedLocalFileIDs = []
+            viewModel.createLocalFolder(named: name)
+            return
+        }
         renamingLocalFileID = nil
         viewModel.renameLocalFile(file, to: name)
     }
 
     private func cancelLocalRename() {
+        if pendingLocalFolder?.id == renamingLocalFileID {
+            pendingLocalFolder = nil
+            viewModel.selectedLocalFileIDs = []
+        }
         renamingLocalFileID = nil
+    }
+
+    private func beginLocalFolderCreation() {
+        guard !viewModel.isWorking, pendingLocalFolder == nil else { return }
+        cancelLocalRename()
+        let name = availableFolderName(in: viewModel.filteredLocalFiles.map(\.name))
+        let folder = LocalFile(
+            url: viewModel.localDirectory.appendingPathComponent(name, isDirectory: true),
+            isDirectory: true,
+            size: 0,
+            addedDate: Date(),
+            kind: "폴더"
+        )
+        pendingLocalFolder = folder
+        viewModel.selectedLocalFileIDs = [folder.id]
+        renamingLocalFileID = folder.id
+        resetClickTracking()
     }
 
     private func beginRemoteRename(_ file: RemoteFile) {
@@ -823,12 +867,66 @@ struct ContentView: View {
 
     private func finishRemoteRename(_ file: RemoteFile, name: String) {
         guard renamingRemoteFileID == file.id else { return }
+        if pendingRemoteFolder?.id == file.id {
+            pendingRemoteFolder = nil
+            renamingRemoteFileID = nil
+            viewModel.selectedRemoteFileIDs = []
+            viewModel.createRemoteFolder(named: name)
+            return
+        }
         renamingRemoteFileID = nil
         viewModel.renameRemoteFile(file, to: name)
     }
 
     private func cancelRemoteRename() {
+        if pendingRemoteFolder?.id == renamingRemoteFileID {
+            pendingRemoteFolder = nil
+            viewModel.selectedRemoteFileIDs = []
+        }
         renamingRemoteFileID = nil
+    }
+
+    private func beginRemoteFolderCreation() {
+        guard viewModel.isConnected,
+              !viewModel.isWorking,
+              !viewModel.isTransferQueueActive,
+              !viewModel.isLoadingRemoteFiles,
+              pendingRemoteFolder == nil else { return }
+        cancelRemoteRename()
+        let name = availableFolderName(in: viewModel.filteredRemoteFiles.map(\.name))
+        let storageID = viewModel.filteredRemoteFiles.first?.storageID ?? 0
+        var objectID = UInt32.max
+        while viewModel.filteredRemoteFiles.contains(where: {
+            $0.storageID == storageID && $0.objectID == objectID
+        }) {
+            objectID &-= 1
+        }
+        let folder = RemoteFile(
+            objectID: objectID,
+            storageID: storageID,
+            name: name,
+            isDirectory: true,
+            size: 0,
+            addedDate: Date(),
+            kind: "폴더"
+        )
+        pendingRemoteFolder = folder
+        viewModel.selectedRemoteFileIDs = [folder.id]
+        renamingRemoteFileID = folder.id
+        resetClickTracking()
+    }
+
+    private func availableFolderName(in existingNames: [String]) -> String {
+        let baseName = "새 폴더"
+        var candidate = baseName
+        var suffix = 2
+        while existingNames.contains(where: {
+            $0.localizedCaseInsensitiveCompare(candidate) == .orderedSame
+        }) {
+            candidate = "\(baseName) \(suffix)"
+            suffix += 1
+        }
+        return candidate
     }
 
     private func handleLocalClick(_ file: LocalFile) {

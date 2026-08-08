@@ -30,11 +30,12 @@ int ad_mtp_list_children(ADMTPConnection *connection,
                          uint32_t storage_id, uint32_t folder_id,
                          ADMTPItem **items, size_t *count, char **error_message);
 int ad_mtp_upload(ADMTPConnection *connection,
-                  const char *local_path, const char *remote_directory,
+                  const char *local_path, const char *remote_name,
+                  const char *remote_directory,
                   ADMTPProgressCallback progress_callback, void *progress_context,
                   char **error_message);
 int ad_mtp_upload_to_folder(ADMTPConnection *connection,
-                            const char *local_path,
+                            const char *local_path, const char *remote_name,
                             uint32_t storage_id, uint32_t folder_id,
                             ADMTPProgressCallback progress_callback,
                             void *progress_context, char **error_message);
